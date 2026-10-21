@@ -1,0 +1,28 @@
+{
+  "command": [
+    "target/release/examples/count_storage_bench",
+    "dense",
+    "3000",
+    "10000",
+    "/tmp/velocity-bench-dense-3000-v2"
+  ],
+  "exit_code": 0,
+  "wall_seconds": 0.8096265969999195,
+  "cpu_user_seconds": 0.43593899999999997,
+  "cpu_system_seconds": 0.35995,
+  "peak_rss_kib": 609844,
+  "storage_read_bytes": 0,
+  "storage_write_bytes": 0,
+  "process_io": {
+    "rchar": 55619,
+    "wchar": 42394,
+    "syscr": 69,
+    "syscw": 24,
+    "read_bytes": 0,
+    "write_bytes": 0,
+    "cancelled_write_bytes": 0
+  },
+  "peak_sampled_disk_bytes": 1839452,
+  "final_disk_bytes": 1839452,
+  "scope": "Linux child process rusage; use Slurm/cgroup accounting for whole-job peak. /proc I/O includes the final zombie-state sample. Disk sampled every second; cache state uncontrolled."
+}

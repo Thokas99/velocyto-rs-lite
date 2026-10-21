@@ -1145,6 +1145,50 @@ impl ExInCounter {
         multimap: bool,
         cell_batch_size: usize,
     ) -> anyhow::Result<(HashMap<String, Vec<ndarray::Array2<u32>>>, Vec<String>)> {
+        let mut layers: HashMap<String, Vec<ndarray::Array2<u32>>> = self
+            .logic
+            .layers()
+            .iter()
+            .map(|name| (name.to_string(), Vec::new()))
+            .collect();
+        let mut keys = Vec::new();
+        self.count_stream(
+            bamfile,
+            multimap,
+            cell_batch_size,
+            0,
+            usize::MAX,
+            |batch, bcs, _| {
+                for (name, arr) in batch {
+                    layers.get_mut(&name).unwrap().push(arr);
+                }
+                keys.extend(bcs);
+                Ok(())
+            },
+        )?;
+        Ok((layers, keys))
+    }
+
+    /// Emit complete raw-barcode groups; `next` is the cursor before lookahead.
+    /// The caller must durably commit a batch before returning success.
+    #[cfg(feature = "bam")]
+    pub fn count_stream(
+        &mut self,
+        bamfile: &str,
+        multimap: bool,
+        cell_batch_size: usize,
+        start_offset: u64,
+        max_batch_bytes: usize,
+        mut emit: impl FnMut(
+            crate::count_checkpoint::DenseLayers,
+            Vec<String>,
+            u64,
+        ) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            cell_batch_size > 0 && max_batch_bytes > 0,
+            "counting limits must be positive"
+        );
         // Reuse or build feature_indexes; reset scanning positions
         if self.feature_indexes.is_empty() {
             self.build_feature_indexes();
@@ -1179,12 +1223,6 @@ impl ExInCounter {
         debug!("Validated {n_is_intron_valid} introns (of which unique intervals {}) out of {n_is_intron} total.",
                unique_valid.len());
 
-        let mut cell_bcs_order: Vec<String> = Vec::new();
-        let mut dict_list_arrays: HashMap<String, Vec<ndarray::Array2<u32>>> = HashMap::new();
-        for layer_name in self.logic.layers() {
-            dict_list_arrays.insert(layer_name.to_string(), Vec::new());
-        }
-
         // `cell_batch` holds composite "{sample}|{bc}" cell identities and drives
         // column allocation; `cell_batch_bcs` holds the raw cell barcodes and
         // drives the flush boundary. They are decoupled because the BAM is sorted
@@ -1207,8 +1245,14 @@ impl ExInCounter {
             .map_err(|e| anyhow::anyhow!("Cannot read BAM header {bamfile}: {e}"))?;
         let mut rec = Record::default();
 
-        let mut pending_read: Option<Read> = None;
+        let mut batch_bytes = 0usize;
+        let mut next_record_offset = 0u64;
         let mut exhausted = false;
+        if start_offset != 0 {
+            reader
+                .get_mut()
+                .seek(noodles_bgzf::VirtualPosition::from(start_offset))?;
+        }
 
         loop {
             // Fetch next valid Read
@@ -1217,6 +1261,7 @@ impl ExInCounter {
             } else {
                 let mut found = None;
                 loop {
+                    next_record_offset = u64::from(reader.get_ref().virtual_position());
                     match reader.read_record(&mut rec) {
                         Ok(0) => {
                             exhausted = true;
@@ -1270,9 +1315,10 @@ impl ExInCounter {
                     // sample-less cell. With demultiplexing off, `sample` is "".
                     let sample = match &self.sample_tag {
                         Some(tag) => {
-                            let sample_tag: [u8; 2] = tag.as_bytes().try_into().map_err(|_| {
-                                anyhow::anyhow!("Sample tag {tag} must be 2 chars")
-                            })?;
+                            let sample_tag: [u8; 2] = tag
+                                .as_bytes()
+                                .try_into()
+                                .map_err(|_| anyhow::anyhow!("Sample tag {tag} must be 2 chars"))?;
                             match rec.data().get(&sample_tag).and_then(|r| r.ok()) {
                                 Some(aux) => aux_to_string(aux),
                                 None => {
@@ -1283,12 +1329,8 @@ impl ExInCounter {
                         }
                         None => String::new(),
                     };
-                    if !self.valid_bcset.contains(&bc) {
-                        if self.filter_mode {
-                            continue;
-                        } else {
-                            self.valid_bcset.insert(bc.clone());
-                        }
+                    if self.filter_mode && !self.valid_bcset.contains(&bc) {
+                        continue;
                     }
                     let tid = match rec.reference_sequence_id() {
                         Some(Ok(id)) => id,
@@ -1357,7 +1399,10 @@ impl ExInCounter {
             let flush = match &r_opt {
                 None => !cell_batch_bcs.is_empty(),
                 Some(r) => {
-                    cell_batch_bcs.len() == cell_batch_size && !cell_batch_bcs.contains(&r.bc)
+                    !cell_batch_bcs.is_empty()
+                        && (cell_batch_bcs.len() >= cell_batch_size
+                            || batch_bytes >= max_batch_bytes / 2)
+                        && !cell_batch_bcs.contains(&r.bc)
                 }
             };
 
@@ -1369,8 +1414,8 @@ impl ExInCounter {
                     reads_to_count.len()
                 );
 
-                let (dict_layer_columns, list_bcs) =
-                    self.count_cell_batch_inner(&cell_batch, &mut reads_to_count);
+                let (mut dict_layer_columns, mut list_bcs) =
+                    self.count_cell_batch_inner(&cell_batch, &mut reads_to_count, max_batch_bytes)?;
 
                 if !self.filter_mode {
                     warn!("The barcode selection mode is off, no cell events will be identified by <80 counts");
@@ -1393,34 +1438,22 @@ impl ExInCounter {
                         n_kept,
                         list_bcs.len()
                     );
-                    cell_bcs_order.extend(
-                        list_bcs
+                    list_bcs = list_bcs
+                        .into_iter()
+                        .enumerate()
+                        .filter_map(|(i, bc)| keep[i].then_some(bc))
+                        .collect();
+                    for arr in dict_layer_columns.values_mut() {
+                        let indices: Vec<usize> = keep
                             .iter()
                             .enumerate()
-                            .filter(|(i, _)| keep[*i])
-                            .map(|(_, bc)| bc.clone()),
-                    );
-                    for (layer_name, arr) in &dict_layer_columns {
-                        let cols: Vec<ndarray::ArrayView1<u32>> = (0..arr.ncols())
-                            .filter(|&j| keep[j])
-                            .map(|j| arr.column(j))
+                            .filter_map(|(i, &k)| k.then_some(i))
                             .collect();
-                        if cols.is_empty() {
-                            dict_list_arrays
-                                .get_mut(layer_name)
-                                .unwrap()
-                                .push(ndarray::Array2::zeros((arr.nrows(), 0)));
-                        } else {
-                            let stacked = ndarray::stack(ndarray::Axis(1), &cols).unwrap();
-                            dict_list_arrays.get_mut(layer_name).unwrap().push(stacked);
-                        }
-                    }
-                } else {
-                    cell_bcs_order.extend(list_bcs);
-                    for (layer_name, arr) in dict_layer_columns {
-                        dict_list_arrays.get_mut(&layer_name).unwrap().push(arr);
+                        *arr = arr.select(ndarray::Axis(1), &indices);
                     }
                 }
+                emit(dict_layer_columns, list_bcs, next_record_offset)?;
+                batch_bytes = 0;
 
                 cell_batch.clear();
                 cell_batch_bcs.clear();
@@ -1435,6 +1468,23 @@ impl ExInCounter {
 
             match r_opt {
                 Some(r) => {
+                    let bytes = std::mem::size_of::<Read>()
+                        + r.bc.len()
+                        + r.umi.len()
+                        + r.sample.len()
+                        + r.chrom.len()
+                        + r.segments.capacity() * 16
+                        + 128;
+                    batch_bytes = batch_bytes.saturating_add(bytes.saturating_mul(2));
+                    anyhow::ensure!(batch_bytes <= max_batch_bytes,
+                        "barcode group exceeds count read budget; checkpoints retained; increase --count-memory-mb or reduce --cell-batch-size");
+                    let dense_bytes = self
+                        .geneid2ix
+                        .len()
+                        .saturating_mul(cell_batch.len() + 1)
+                        .saturating_mul(self.logic.layers().len())
+                        .saturating_mul(8);
+                    anyhow::ensure!(dense_bytes <= max_batch_bytes, "composite cell batch exceeds dense scratch budget; reduce --cell-batch-size");
                     cell_batch_bcs.insert(r.bc.clone());
                     cell_batch.insert(format!("{}|{}", r.sample, r.bc));
                     reads_to_count.push(r);
@@ -1442,13 +1492,12 @@ impl ExInCounter {
                 None => break,
             }
         }
-        let _ = pending_read;
 
         if self.sample_tag.is_some() {
             debug!("{no_sample_tag_count} reads dropped: missing sample tag");
         }
         debug!("Counting done!");
-        Ok((dict_list_arrays, cell_bcs_order))
+        Ok(())
     }
 
     /// Dispatch to stranded / non_stranded batch counting.
@@ -1457,15 +1506,20 @@ impl ExInCounter {
         &mut self,
         cell_batch: &HashSet<String>,
         reads_to_count: &mut Vec<Read>,
-    ) -> (HashMap<String, ndarray::Array2<u32>>, Vec<String>) {
+        max_evidence_bytes: usize,
+    ) -> anyhow::Result<(HashMap<String, ndarray::Array2<u32>>, Vec<String>)> {
         if self.logic.stranded() {
             if self.logic.accept_discordant() {
-                self.count_cell_batch_stranded_discordant_inner(cell_batch, reads_to_count)
+                self.count_cell_batch_stranded_discordant_inner(
+                    cell_batch,
+                    reads_to_count,
+                    max_evidence_bytes,
+                )
             } else {
-                self.count_cell_batch_stranded_inner(cell_batch, reads_to_count)
+                self.count_cell_batch_stranded_inner(cell_batch, reads_to_count, max_evidence_bytes)
             }
         } else {
-            self.count_cell_batch_non_stranded_inner(cell_batch, reads_to_count)
+            self.count_cell_batch_non_stranded_inner(cell_batch, reads_to_count, max_evidence_bytes)
         }
     }
 
@@ -1475,8 +1529,10 @@ impl ExInCounter {
         &mut self,
         cell_batch: &HashSet<String>,
         reads_to_count: &mut Vec<Read>,
-    ) -> (HashMap<String, ndarray::Array2<u32>>, Vec<String>) {
+        max_evidence_bytes: usize,
+    ) -> anyhow::Result<(HashMap<String, ndarray::Array2<u32>>, Vec<String>)> {
         let mut molitems: HashMap<String, Molitem> = HashMap::new();
+        let mut evidence_bytes = 0usize;
         reads_to_count.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let mut repeats_reads_count = 0usize;
         let mut no_key_count = 0usize;
@@ -1502,6 +1558,7 @@ impl ExInCounter {
                 .get_mut(&cs_key)
                 .map(|ii| ii.find_overlapping_ivls(r))
                 .unwrap_or_default();
+            charge_mapping(&mappings_record, &mut evidence_bytes, max_evidence_bytes)?;
             if !mappings_record.is_empty() {
                 let bcumi = format!("{}|{}${}", r.sample, r.bc, r.umi);
                 molitems
@@ -1528,7 +1585,7 @@ impl ExInCounter {
             "batch: {repeats_reads_count} repeat-masked, {no_key_count} no-key, \
                 {no_overlap_count} no-overlap, {mapped_count} mapped"
         );
-        self.finalize_batch(cell_batch, &molitems)
+        Ok(self.finalize_batch(cell_batch, &molitems))
     }
 
     /// Python: _count_cell_batch_stranded_discordant
@@ -1537,8 +1594,10 @@ impl ExInCounter {
         &mut self,
         cell_batch: &HashSet<String>,
         reads_to_count: &mut Vec<Read>,
-    ) -> (HashMap<String, ndarray::Array2<u32>>, Vec<String>) {
+        max_evidence_bytes: usize,
+    ) -> anyhow::Result<(HashMap<String, ndarray::Array2<u32>>, Vec<String>)> {
         let mut molitems: HashMap<String, Molitem> = HashMap::new();
+        let mut evidence_bytes = 0usize;
         reads_to_count.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let mut repeats_reads_count = 0usize;
         for r in reads_to_count.iter() {
@@ -1569,6 +1628,7 @@ impl ExInCounter {
                     .map(|ii| ii.find_overlapping_ivls(r))
                     .unwrap_or_default()
             };
+            charge_mapping(&mappings_record, &mut evidence_bytes, max_evidence_bytes)?;
             if !mappings_record.is_empty() {
                 let bcumi = format!("{}|{}${}", r.sample, r.bc, r.umi);
                 molitems
@@ -1578,7 +1638,7 @@ impl ExInCounter {
             }
         }
         debug!("{repeats_reads_count} reads not considered because fully enclosed in repeat masked regions");
-        self.finalize_batch(cell_batch, &molitems)
+        Ok(self.finalize_batch(cell_batch, &molitems))
     }
 
     /// Python: _count_cell_batch_non_stranded
@@ -1587,8 +1647,10 @@ impl ExInCounter {
         &mut self,
         cell_batch: &HashSet<String>,
         reads_to_count: &mut Vec<Read>,
-    ) -> (HashMap<String, ndarray::Array2<u32>>, Vec<String>) {
+        max_evidence_bytes: usize,
+    ) -> anyhow::Result<(HashMap<String, ndarray::Array2<u32>>, Vec<String>)> {
         let mut molitems: HashMap<String, Molitem> = HashMap::new();
+        let mut evidence_bytes = 0usize;
         reads_to_count.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let mut repeats_reads_count = 0usize;
         for r in reads_to_count.iter() {
@@ -1613,6 +1675,7 @@ impl ExInCounter {
                 .get_mut(&cs_key)
                 .map(|ii| ii.find_overlapping_ivls(r))
                 .unwrap_or_default();
+            charge_mapping(&mappings_record, &mut evidence_bytes, max_evidence_bytes)?;
             if !mappings_record.is_empty() {
                 let bcumi = format!("{}|{}${}", r.sample, r.bc, r.umi);
                 molitems
@@ -1625,6 +1688,7 @@ impl ExInCounter {
                 .get_mut(&cs_rev_key)
                 .map(|iir| iir.find_overlapping_ivls(r))
                 .unwrap_or_default();
+            charge_mapping(&mappings_record_r, &mut evidence_bytes, max_evidence_bytes)?;
             if !mappings_record_r.is_empty() {
                 let bcumi = format!("{}|{}${}", r.sample, r.bc, r.umi);
                 molitems
@@ -1634,7 +1698,7 @@ impl ExInCounter {
             }
         }
         debug!("{repeats_reads_count} reads in repeat masked regions");
-        self.finalize_batch(cell_batch, &molitems)
+        Ok(self.finalize_batch(cell_batch, &molitems))
     }
 
     /// Shared finalization: run logic.count for each molitem, return layer columns.
@@ -2522,4 +2586,22 @@ mod tests {
             .attr_exists("encoding-type")
             .unwrap());
     }
+}
+
+#[cfg(feature = "bam")]
+fn charge_mapping(
+    mapping: &HashMap<usize, Vec<crate::segment_match::SegmentMatch>>,
+    used: &mut usize,
+    limit: usize,
+) -> anyhow::Result<()> {
+    let bytes = mapping.values().fold(0usize, |n, v| {
+        n.saturating_add(
+            v.capacity()
+                .saturating_mul(std::mem::size_of::<crate::segment_match::SegmentMatch>())
+                .saturating_add(128),
+        )
+    });
+    *used = used.saturating_add(bytes.saturating_mul(4));
+    anyhow::ensure!(*used <= limit, "molecule evidence exceeds count budget; checkpoints retained; increase --count-memory-mb or reduce --cell-batch-size");
+    Ok(())
 }

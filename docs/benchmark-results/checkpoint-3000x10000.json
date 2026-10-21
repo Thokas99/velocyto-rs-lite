@@ -1,0 +1,28 @@
+{
+  "command": [
+    "target/release/examples/count_storage_bench",
+    "checkpoint",
+    "3000",
+    "10000",
+    "/tmp/velocity-bench-checkpoint-3000-v2"
+  ],
+  "exit_code": 0,
+  "wall_seconds": 0.45571225799994863,
+  "cpu_user_seconds": 0.393818,
+  "cpu_system_seconds": 0.019039,
+  "peak_rss_kib": 29776,
+  "storage_read_bytes": 0,
+  "storage_write_bytes": 0,
+  "process_io": {
+    "rchar": 742997,
+    "wchar": 2188806,
+    "syscr": 120,
+    "syscw": 169,
+    "read_bytes": 0,
+    "write_bytes": 0,
+    "cancelled_write_bytes": 0
+  },
+  "peak_sampled_disk_bytes": 2675702,
+  "final_disk_bytes": 2675702,
+  "scope": "Linux child process rusage; use Slurm/cgroup accounting for whole-job peak. /proc I/O includes the final zombie-state sample. Disk sampled every second; cache state uncontrolled."
+}

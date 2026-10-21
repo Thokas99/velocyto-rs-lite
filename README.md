@@ -36,7 +36,7 @@ The smaller RAM advantage on the large dataset is expected: the 1.5 GB GTF domin
 
 ### BAM reader: noodles vs htslib
 
-BAM/SAM reading was migrated from `rust-htslib` (which links the C `htslib` library and needs `libclang` to build) to the pure-Rust [`noodles`](https://github.com/zaeleus/noodles) crates, removing the last C build dependency for `--features bam`. Re-baselined on one machine, same inputs, `samtools sort` skipped equally, both built `--release --features bam`; output is bit-for-bit identical.
+BAM/SAM reading was migrated from `rust-htslib` (which links the C `htslib` library and needs `libclang` to build) to the pure-Rust [`noodles`](https://github.com/zaeleus/noodles) crates, removing the BAM reader's C build dependency. The new streaming output backend separately requires HDF5. Re-baselined on one machine, same inputs, `samtools sort` skipped equally, both built `--release --features bam`; output is bit-for-bit identical.
 
 | Dataset | Metric | `rust-htslib` | `noodles` | Improvement |
 |---|---|---|---|---|
@@ -78,9 +78,9 @@ The dominant cost for large reference genomes is loading the GTF annotation. Thr
 cargo build --release
 ```
 
-BAM support is **on by default** (pure-Rust [`noodles`](https://github.com/zaeleus/noodles) backend — no `libclang`, `htslib`, or any C library to build). Pass `--no-default-features` only if you want the dependency-light stub build without BAM support.
+BAM support is **on by default**, using pure-Rust [`noodles`](https://github.com/zaeleus/noodles). Streaming output requires the native HDF5 development library and `pkg-config` (tested with HDF5 1.14.6), plus Rust 1.89 or later. On Debian/Ubuntu install `libhdf5-dev pkg-config`; on Slurm load your site's HDF5 module before building and running. `--no-default-features` disables BAM support; checkpoint export still requires HDF5.
 
-> **No samtools required at runtime.** The cell-barcode sort uses the `samtools` binary when it is on `PATH`, but otherwise falls back to a built-in pure-Rust disk-spilling external merge sort (`src/bam_sort.rs`). It is output-equivalent to `samtools sort -t CB` (verified against a 28.4 M-read fixture: identical per-barcode read counts). So velocyto-rs has no hard dependency on samtools or any C library.
+> **No samtools required at runtime.** Quantification uses the built-in Rust disk-spilling sort, sequentially across input BAMs, with a maximum merge fan-in of 32. Sort runs and partial files are retained. Existing `--samtools-threads` and `--samtools-memory` names remain accepted and control Rust sort threads and the total chunk budget in MiB. A sorted BAM is reused only when its completion receipt matches the source, output and barcode tag.
 
 ## Usage
 
@@ -138,8 +138,8 @@ Key options:
 | `-M / --multimap` | false | Count non-uniquely mapped reads (not recommended) |
 | `-t / --dtype` | `uint32` | Layer array dtype; use `uint16` for low-depth data |
 | `--output-format` | `h5ad` | Output file format: `h5ad` (AnnData), `loom`, or `both` (see [Output formats](#output-formats)) |
-| `--samtools-threads` | 16 | Sort threads — used by `samtools sort` if installed, else by the built-in pure-Rust sort |
-| `--samtools-memory` | 2048 | MB per sort thread / per in-memory sort chunk before spilling to disk |
+| `--samtools-threads` | 16 | Built-in Rust sort threads, bounded by CPU affinity and Slurm allocation |
+| `--samtools-memory` | 2048 | MiB per in-memory Rust sort chunk; bounded by available/cgroup/Slurm memory |
 | `--cb-tag` | auto | BAM tag for cell barcode (e.g. `CB`, `XC`); skips auto-detection when both tags are set |
 | `--ub-tag` | auto | BAM tag for UMI barcode (e.g. `UB`, `XM`); skips auto-detection when both tags are set |
 | `--sample-tag` | — | BAM tag carrying sample identity (e.g. BD Rhapsody `ST`); demultiplexes a multi-sample BAM in place (see [Sample demultiplexing](#sample-demultiplexing)) |
@@ -255,7 +255,7 @@ The remaining subcommands follow the same shape:
 
 > **Note:** AnnData (h5ad) output is an extension beyond the v0.17.16 port — upstream velocyto only ever emitted loom. The two files carry identical counts; they differ only in on-disk layout.
 
-Both formats are written directly via the bundled pure-Rust HDF5 implementation (`hdf5-pure-rs`) — no C/HDF5 library and no Python dependency at runtime.
+CLI output streams from persistent sparse count checkpoints through the maintained `hdf5-metno` Rust binding to native HDF5. No Python is needed at runtime. Legacy library writers remain available for compatibility and comparison; they still collect dense arrays and are unsuitable for large exports.
 
 ### h5ad layout
 
@@ -299,3 +299,47 @@ If you use this software, cite the original velocyto paper:
 ## License
 
 BSD 2-Clause License. See [LICENSE](LICENSE). Derived from [velocyto.py](https://github.com/velocyto-team/velocyto.py) by Peter Kharchenko, Sten Linnarsson and Gioele La Manno.
+
+## Recoverable quantification
+
+For BD Rhapsody, retain the explicit tag overrides:
+
+```bash
+velocyto-rs run /data/sample.bam /data/genes.gtf \
+  -b /data/barcodes.txt -o /persistent/velocity -e sample \
+  --cb-tag CB --ub-tag MA \
+  --checkpoint-dir /persistent/velocity/sample.counts \
+  --cell-batch-size 100 --count-memory-mb 512
+```
+
+Each completed raw-barcode group batch is compressed into sparse integer rows, synced to disk, and atomically added to a versioned manifest. Counts do not accumulate in a whole-dataset dense matrix. Small dense batch scratch preserves the existing molecule-assignment logic. Spliced, unspliced, ambiguous and any additional logic layers retain uint32 counts. The existing `uint16` export option remains explicitly lossy; checkpoints retain uint32 values.
+
+After a failed export, regenerate output **without BAM, GTF or barcode files**:
+
+```bash
+velocyto-rs write-output /persistent/velocity/sample.counts \
+  -o /persistent/velocity --output-format h5ad
+```
+
+To resume interrupted counting, repeat the original `run` arguments and replace `--checkpoint-dir` with `--resume-from /persistent/velocity/sample.counts`. Completed batches are verified and counting seeks to the next unread BGZF record. Counting resume currently rebuilds annotation and reruns intron validation on the original BAMs; output-only restart does neither. Input identities use canonical paths, byte sizes and modification times, not cryptographic content hashes: inputs must remain immutable. Only generic `run` exposes count-budget/resume flags; all run wrappers use durable checkpoints with default budgets, and `write-output` works for their checkpoints too.
+
+Use persistent project storage for checkpoints and sort spills, not job-local scratch that Slurm may remove. No intermediates or partial output files are automatically deleted, including after successful runs. Retained multi-pass sort runs can occupy several times the input BAM size. Cleanup is manual. Unmarked legacy `cellsorted_*` BAMs are refused rather than trusted; move them aside before a fresh sort. Filesystem locking, atomic rename and fsync must be supported by the chosen filesystem.
+
+`--count-memory-mb` limits estimated read, mapping-evidence and scratch components separately; it is not a total-RSS guarantee. Annotation/index structures, metadata and HDF5 caches add memory. Oversized individual barcode/UMI groups fail explicitly with checkpoints intact; disk-backed processing of a single oversized molecule is not implemented. Reduce the batch size or increase the component budget within the job allocation. Cell groups are never split to force a fit. H5AD uses int64 row offsets; `X` remains float32 and can round large integer totals, while integer layers remain exact.
+
+See [audit/design](docs/memory-efficient-quantification-plan.md), [implementation and verification record](docs/quantification-implementation.md), and [benchmark results](docs/quantification-benchmarks.md).
+
+### Measuring a Slurm run
+
+The benchmark driver records wall time, peak process RSS, CPU time, logical `/proc` I/O, storage block I/O, exit status and sampled intermediate disk size. It writes a report even when the child is killed. Run it inside the allocation:
+
+```bash
+python3 scripts/benchmark_quantification.py \
+  --report /persistent/velocity/run-metrics.json \
+  --workdir /persistent/velocity -- \
+  velocyto-rs run /data/sample.bam /data/genes.gtf \
+    -b /data/barcodes.txt -o /persistent/velocity -e sample \
+    --cb-tag CB --ub-tag MA --cell-batch-size 100 --count-memory-mb 512
+```
+
+Also retain Slurm `sacct` and cgroup peak-memory accounting: per-process RSS is not whole-job memory. Cached/tmpfs I/O can report zero storage block traffic; logical writes and final disk occupancy are separate measurements. If Slurm kills the entire job including the benchmark parent, its report cannot be finalized, but committed counting checkpoints survive.

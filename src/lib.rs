@@ -1,15 +1,14 @@
-#![allow(
-    unused_variables,
-    unused_imports,
-    unused_mut,
-    non_snake_case
-)]
+#![allow(unused_variables, unused_imports, unused_mut, non_snake_case)]
 
 pub mod analysis;
 #[cfg(feature = "bam")]
 pub mod bam_sort;
 pub mod commands;
 pub mod constants;
+pub mod count_checkpoint;
+pub mod count_output;
+#[cfg(all(test, feature = "bam"))]
+mod count_regression;
 pub mod counter;
 pub mod diffusion;
 pub mod estimation;

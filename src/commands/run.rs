@@ -14,12 +14,30 @@ use crate::constants::BAM_COMPRESSION;
 use crate::counter::ExInCounter;
 use crate::logic::logic_from_name;
 
-/// Handle for one in-flight cell-barcode sort: either an external `samtools`
-/// subprocess or a pure-Rust sort running on a background thread.
-#[cfg(feature = "bam")]
-enum SortHandle {
-    Samtools(std::process::Child),
-    Rust(std::thread::JoinHandle<anyhow::Result<()>>),
+#[derive(Args)]
+pub struct CountingOptions {
+    /// Persistent count checkpoint directory (default: OUTPUT/SAMPLE.counts)
+    #[arg(long, conflicts_with = "resume_from")]
+    pub checkpoint_dir: Option<std::path::PathBuf>,
+    /// Resume counting from this checkpoint (inputs and settings must match)
+    #[arg(long)]
+    pub resume_from: Option<std::path::PathBuf>,
+    /// Maximum raw barcodes per count batch; groups are never split
+    #[arg(long, default_value_t = 100)]
+    pub cell_batch_size: usize,
+    /// MiB budget per count read/evidence/scratch component (not total job RSS)
+    #[arg(long, default_value_t = 512)]
+    pub count_memory_mb: usize,
+}
+impl Default for CountingOptions {
+    fn default() -> Self {
+        Self {
+            checkpoint_dir: None,
+            resume_from: None,
+            cell_batch_size: 100,
+            count_memory_mb: 512,
+        }
+    }
 }
 
 /// Arguments for the generic `run` subcommand.
@@ -29,6 +47,8 @@ enum SortHandle {
 /// parallelism, and output format.
 #[derive(Args)]
 pub struct RunArgs {
+    #[command(flatten)]
+    pub counting: CountingOptions,
     /// Enable verbose (debug) logging
     #[arg(short, long)]
     pub verbose: bool,
@@ -69,10 +89,10 @@ pub struct RunArgs {
     /// Consider non-unique mappings (not recommended)
     #[arg(short = 'M', long, default_value_t = false)]
     pub multimap: bool,
-    /// Number of threads for samtools sort
+    /// Number of threads for the built-in Rust barcode sort
     #[arg(long, default_value_t = 16)]
     pub samtools_threads: usize,
-    /// MB of memory per thread for samtools sort
+    /// MiB per sort chunk for the built-in Rust barcode sort
     #[arg(long, default_value_t = 2048)]
     pub samtools_memory: usize,
     /// dtype for loom layer arrays: "uint32" (default, lossless) or "uint16" (smaller, saturates at 65535)
@@ -102,7 +122,7 @@ pub struct RunArgs {
 ///
 /// Thin wrapper that forwards all [`RunArgs`] fields to [`run_inner`].
 pub fn run(args: RunArgs) -> anyhow::Result<()> {
-    run_inner(
+    run_inner_with_options(
         &args.bamfile,
         &args.gtffile,
         args.bcfile.as_deref(),
@@ -123,6 +143,7 @@ pub fn run(args: RunArgs) -> anyhow::Result<()> {
         args.ub_tag.as_deref(),
         args.sample_tag.as_deref(),
         &args.output_format,
+        &args.counting,
     )
 }
 
@@ -205,10 +226,78 @@ pub fn run_inner(
     sample_tag: Option<&str>,
     output_format: &str,
 ) -> anyhow::Result<()> {
+    run_inner_with_options(
+        bamfile,
+        gtffile,
+        bcfile,
+        outputfolder,
+        sampleid,
+        repmask,
+        onefilepercell,
+        logic,
+        without_umi,
+        umi_extension,
+        multimap,
+        samtools_threads,
+        samtools_memory,
+        dump,
+        loom_numeric_dtype,
+        additional_ca,
+        cb_tag,
+        ub_tag,
+        sample_tag,
+        output_format,
+        &CountingOptions::default(),
+    )
+}
+
+#[cfg(feature = "bam")]
+fn run_inner_with_options(
+    bamfile: &[String],
+    gtffile: &str,
+    bcfile: Option<&str>,
+    outputfolder: Option<&str>,
+    sampleid: Option<&str>,
+    repmask: Option<&str>,
+    onefilepercell: bool,
+    logic: &str,
+    without_umi: bool,
+    umi_extension: &str,
+    multimap: bool,
+    samtools_threads: usize,
+    samtools_memory: usize,
+    dump: &str,
+    loom_numeric_dtype: &str,
+    additional_ca: &[(&str, Vec<f32>)],
+    cb_tag: Option<&str>,
+    ub_tag: Option<&str>,
+    sample_tag: Option<&str>,
+    output_format: &str,
+    counting: &CountingOptions,
+) -> anyhow::Result<()> {
     // ── Resolve inputs ────────────────────────────────────────────────────────
     validate_loom_dtype(loom_numeric_dtype)?;
     validate_output_format(output_format)?;
 
+    anyhow::ensure!(!bamfile.is_empty(), "at least one BAM is required");
+    anyhow::ensure!(
+        counting.cell_batch_size > 0 && counting.count_memory_mb > 0,
+        "counting limits must be positive"
+    );
+    let count_bytes = counting
+        .count_memory_mb
+        .checked_mul(1024 * 1024)
+        .context("count budget overflow")?;
+    let previous = counting
+        .resume_from
+        .as_ref()
+        .map(|p| crate::count_checkpoint::Checkpoint::open(p))
+        .transpose()?;
+    let sampleid = sampleid.or_else(|| {
+        previous
+            .as_ref()
+            .map(|c| c.manifest.metadata.sample.as_str())
+    });
     let multi = bamfile.len() > 1;
 
     if onefilepercell && multi && bcfile.is_some() {
@@ -298,7 +387,6 @@ pub fn run_inner(
         umi_extension
     };
     let logic_box = logic_from_name(logic);
-    let layer_names: Vec<String> = logic_box.layers().iter().map(|s| s.to_string()).collect();
 
     let mut exincounter = ExInCounter::new(
         sampleid.clone(),
@@ -313,10 +401,10 @@ pub fn run_inner(
 
     // ── Memory / thread heuristic ─────────────────────────────────────────────
     let mb_available = read_mem_available_mb();
-    let threads_to_use = samtools_threads.min(num_cpus());
-    let mb_to_use = ((samtools_memory as u64)
-        .min(mb_available / (bamfile.len() as u64 * threads_to_use as u64).max(1)))
-        as usize;
+    let threads_to_use = samtools_threads.max(1).min(num_cpus());
+    let mb_to_use = (samtools_memory as u64)
+        .min((mb_available / 2).max(1))
+        .max(1) as usize;
 
     // ── Peek BAM for tag names ────────────────────────────────────────────────
     // When both tags are supplied explicitly, skip the 1000-read peek entirely.
@@ -365,76 +453,20 @@ pub fn run_inner(
             .collect()
     };
 
-    // ── Launch cell-barcode sorts ─────────────────────────────────────────────
-    // Prefer the external `samtools` binary when present (battle-tested);
-    // otherwise fall back to the pure-Rust disk-spilling sort so the pipeline
-    // has no hard runtime dependency on the samtools C binary.
-    let have_samtools = Command::new("samtools")
-        .arg("--version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-    if have_samtools {
-        log::info!("samtools found on PATH; using it for cell-barcode sorting");
-    } else {
-        log::info!("samtools not found on PATH; using the pure-Rust cell-barcode sort");
-    }
-
-    let mut sorting_processes: Vec<Option<SortHandle>> = Vec::new();
-    for (ni, bmf_cellsorted) in bamfile_cellsorted.iter().enumerate() {
-        if Path::new(bmf_cellsorted).exists() {
-            log::warn!("File {bmf_cellsorted} already exists; skipping sort.");
-            sorting_processes.push(None);
-        } else if tagname == "NOTAG" {
-            // onefilepercell / without-umi: no cell-barcode grouping is needed
-            // (the input is consumed directly), so there is nothing to sort.
-            sorting_processes.push(None);
-        } else if have_samtools {
-            log::info!(
-                "Starting samtools sort of {} → {bmf_cellsorted}",
-                bamfile[ni]
-            );
-            let child = Command::new("samtools")
-                .args([
-                    "sort",
-                    "-l",
-                    &BAM_COMPRESSION.to_string(),
-                    "-m",
-                    &format!("{mb_to_use}M"),
-                    "-t",
-                    &tagname,
-                    "-O",
-                    "BAM",
-                    "-@",
-                    &threads_to_use.to_string(),
-                    "-o",
-                    bmf_cellsorted,
-                    &bamfile[ni],
-                ])
-                .stdout(Stdio::piped())
-                .spawn()
-                .with_context(|| "Failed to launch samtools sort")?;
-            sorting_processes.push(Some(SortHandle::Samtools(child)));
-        } else {
-            log::info!(
-                "Starting pure-Rust cell-barcode sort of {} → {bmf_cellsorted}",
-                bamfile[ni]
-            );
-            let input = std::path::PathBuf::from(&bamfile[ni]);
-            let output = std::path::PathBuf::from(bmf_cellsorted);
-            let tag = tagname.clone();
-            let mb = mb_to_use;
-            let threads = threads_to_use;
-            let handle = std::thread::spawn(move || {
-                crate::bam_sort::sort_bam_by_tag(&input, &output, &tag, mb, threads)
-            });
-            sorting_processes.push(Some(SortHandle::Rust(handle)));
+    // Sort sequentially before annotation allocation; persistent Rust spills survive errors.
+    if tagname != "NOTAG" {
+        for (input, output) in bamfile.iter().zip(&bamfile_cellsorted) {
+            crate::bam_sort::prepare_sorted_bam(
+                Path::new(input),
+                Path::new(output),
+                &tagname,
+                mb_to_use,
+                threads_to_use,
+            )?;
         }
     }
 
-    // ── Load annotations (while samtools runs) ────────────────────────────────
+    // ── Load annotations after sorting ────────────────────────────────
     log::info!("Loading annotation from {gtffile}");
     exincounter.read_transcriptmodels(gtffile)?;
 
@@ -449,105 +481,79 @@ pub fn run_inner(
         exincounter.mark_up_introns(bmf, multimap)?;
     }
 
-    // ── Wait for cell-barcode sorts ───────────────────────────────────────────
-    for (ni, handle_opt) in sorting_processes.into_iter().enumerate() {
-        match handle_opt {
-            Some(SortHandle::Samtools(mut child)) => {
-                let status = child.wait().with_context(|| "samtools sort wait failed")?;
-                if !status.success() {
-                    bail!(
-                        "samtools sort of BAM #{ni} failed (exit {:?}). \
-                        Ensure samtools >= 1.6. Sort manually: \
-                        samtools sort -l {BAM_COMPRESSION} -m {mb_to_use}M -t {tagname} \
-                        -O BAM -@ {threads_to_use} -o cellsorted_<bam> <bam>",
-                        status.code()
-                    );
-                }
-                log::info!("BAM #{ni} sorted successfully");
-            }
-            Some(SortHandle::Rust(handle)) => {
-                handle
-                    .join()
-                    .map_err(|_| anyhow::anyhow!("cell-barcode sort thread #{ni} panicked"))?
-                    .with_context(|| format!("pure-Rust cell-barcode sort of BAM #{ni} failed"))?;
-                log::info!("BAM #{ni} sorted successfully");
-            }
-            None => {}
-        }
-    }
-
-    // ── Count ─────────────────────────────────────────────────────────────────
-    log::info!("Starting molecule counting");
-    let mut all_layers: std::collections::HashMap<String, Vec<ndarray::Array2<u32>>> = layer_names
+    // ── Durable counts and bounded output ────────────────────────────────────
+    use crate::count_checkpoint::{Checkpoint, InputIdentity, Metadata};
+    let identities = bamfile_cellsorted
         .iter()
-        .map(|n| (n.clone(), Vec::new()))
-        .collect();
-    let mut all_bcs: Vec<String> = Vec::new();
-
-    for bmf_cellsorted in &bamfile_cellsorted {
-        let (dict_list_arrays, cell_bcs_order) =
-            exincounter.count(bmf_cellsorted, multimap, 100)?;
-        for name in &layer_names {
-            if let Some(batches) = dict_list_arrays.get(name) {
-                all_layers
-                    .get_mut(name)
-                    .unwrap()
-                    .extend(batches.iter().cloned());
-            }
-        }
-        all_bcs.extend(cell_bcs_order);
-    }
-
-    // ── Build CellID + SampleID lists ─────────────────────────────────────────
-    // Counting keys each cell as "{sample}|{bc}". Split that back into the sample
-    // tag and bare barcode. With demultiplexing off, `sample` is empty and the
-    // CellID format is unchanged ({sampleid}:{bc}{gem_grp}); with it on, the
-    // sample is folded into the CellID and emitted as a SampleID column attr.
-    let gem_grp_used = if exincounter.filter_mode {
+        .map(|p| InputIdentity::read(Path::new(p)))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let mut provenance_paths: Vec<&str> = bamfile.iter().map(String::as_str).collect();
+    provenance_paths.push(gtffile);
+    provenance_paths.extend(bcfile);
+    provenance_paths.extend(repmask);
+    let provenance = provenance_paths
+        .iter()
+        .map(|p| InputIdentity::read(Path::new(p)))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let settings = serde_json::to_string(&(
+        env!("CARGO_PKG_VERSION"),
+        logic,
+        multimap,
+        umi_ext,
+        onefilepercell,
+        &exincounter.cellbarcode_str,
+        &exincounter.umibarcode_str,
+        sample_tag,
+        provenance,
+    ))?;
+    let gem = if exincounter.filter_mode {
         gem_grp
     } else {
         String::new()
     };
-    let mut cell_ids: Vec<String> = Vec::with_capacity(all_bcs.len());
-    let mut sample_ids: Vec<String> = Vec::with_capacity(all_bcs.len());
-    let mut any_sample = false;
-    for key in &all_bcs {
-        let (sample, bc) = key.split_once('|').unwrap_or(("", key.as_str()));
-        if sample.is_empty() {
-            cell_ids.push(format!("{sampleid}:{bc}{gem_grp_used}"));
-        } else {
-            any_sample = true;
-            cell_ids.push(format!("{sampleid}_{sample}:{bc}{gem_grp_used}"));
-        }
-        sample_ids.push(sample.to_string());
-    }
-    let sample_ids_opt = if any_sample {
-        Some(sample_ids.as_slice())
+    let metadata = Metadata::from_counter(&exincounter, gem, identities, settings)?;
+    let root = counting
+        .resume_from
+        .clone()
+        .or_else(|| counting.checkpoint_dir.clone())
+        .unwrap_or_else(|| Path::new(&outputfolder).join(format!("{sampleid}.counts")));
+    let mut checkpoint = if counting.resume_from.is_some() {
+        Checkpoint::resume(&root, &metadata)?
     } else {
-        None
+        Checkpoint::create(&root, metadata)?
     };
-
-    // ── Write output ──────────────────────────────────────────────────────────
-    // `output_format` selects loom, h5ad (default), or both. h5ad is the modern
-    // AnnData format; loom is kept for backward compatibility.
-    let want_loom = matches!(output_format, "loom" | "both");
-    let want_h5ad = matches!(output_format, "h5ad" | "both");
-    if want_loom {
-        let outfile = Path::new(&outputfolder)
-            .join(format!("{sampleid}.loom"))
-            .to_string_lossy()
-            .to_string();
-        log::info!("Writing loom output to {outfile}");
-        exincounter.dump_loom(&outfile, &all_layers, &cell_ids, sample_ids_opt)?;
+    log::info!("Persistent counting checkpoint: {}", root.display());
+    for (source, bam) in bamfile_cellsorted.iter().enumerate() {
+        if checkpoint.manifest.sources[source].complete {
+            continue;
+        }
+        let offset = checkpoint.manifest.sources[source].offset;
+        exincounter.count_stream(
+            bam,
+            multimap,
+            counting.cell_batch_size,
+            offset,
+            count_bytes,
+            |layers, keys, next| {
+                checkpoint.commit_batch(source, next, &layers, &keys)?;
+                log::info!(
+                    "Committed count batch {} ({} cells)",
+                    checkpoint.manifest.batches.len(),
+                    keys.len()
+                );
+                Ok(())
+            },
+        )?;
+        checkpoint.finish_source(source)?;
     }
-    if want_h5ad {
-        let outfile = Path::new(&outputfolder)
-            .join(format!("{sampleid}.h5ad"))
-            .to_string_lossy()
-            .to_string();
-        log::info!("Writing h5ad output to {outfile}");
-        exincounter.dump_anndata(&outfile, &all_layers, &cell_ids, sample_ids_opt)?;
-    }
+    // Annotation and barcode buffers are not needed by checkpoint-backed export.
+    drop(exincounter);
+    crate::commands::write_output::export(
+        &checkpoint,
+        Path::new(&outputfolder),
+        &sampleid,
+        output_format,
+    )?;
 
     let _ = additional_ca; // float col attrs not yet supported by hdf5-pure-rust string-only API
 
@@ -584,26 +590,84 @@ pub fn run_inner(
     anyhow::bail!("BAM support required. Recompile with: cargo build --features bam")
 }
 
+#[cfg(not(feature = "bam"))]
+fn run_inner_with_options(
+    bamfile: &[String],
+    gtffile: &str,
+    bcfile: Option<&str>,
+    outputfolder: Option<&str>,
+    sampleid: Option<&str>,
+    repmask: Option<&str>,
+    onefilepercell: bool,
+    logic: &str,
+    without_umi: bool,
+    umi_extension: &str,
+    multimap: bool,
+    samtools_threads: usize,
+    samtools_memory: usize,
+    dump: &str,
+    loom_numeric_dtype: &str,
+    additional_ca: &[(&str, Vec<f32>)],
+    cb_tag: Option<&str>,
+    ub_tag: Option<&str>,
+    sample_tag: Option<&str>,
+    output_format: &str,
+    counting: &CountingOptions,
+) -> anyhow::Result<()> {
+    anyhow::bail!("BAM support required. Recompile with: cargo build --features bam")
+}
+
 /// Read the `MemAvailable` field from `/proc/meminfo` and return it in MB.
 ///
 /// Falls back to 32 000 MB (≈ 32 GB) when `/proc/meminfo` is unavailable
 /// (non-Linux systems) or the field cannot be parsed.
 #[cfg(feature = "bam")]
 fn read_mem_available_mb() -> u64 {
-    let Ok(f) = fs::File::open("/proc/meminfo") else {
-        return 32000;
-    };
-    for line in BufReader::new(f).lines().map_while(Result::ok) {
-        if line.starts_with("MemAvailable:") {
-            let kb: u64 = line
+    let host = fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find(|line| line.starts_with("MemAvailable:"))?
                 .split_whitespace()
-                .nth(1)
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(32_000_000);
-            return kb / 1000;
+                .nth(1)?
+                .parse::<u64>()
+                .ok()
+        })
+        .map(|kb| kb / 1024)
+        .unwrap_or(32_000);
+    let env_number = |name| std::env::var(name).ok().and_then(|s| s.parse::<u64>().ok());
+    let slurm = env_number("SLURM_MEM_PER_NODE").or_else(|| {
+        env_number("SLURM_MEM_PER_CPU")?.checked_mul(
+            env_number("SLURM_CPUS_PER_TASK").or_else(|| env_number("SLURM_CPUS_ON_NODE"))?,
+        )
+    });
+    let mut available = host.min(slurm.unwrap_or(host));
+    if let Ok(groups) = fs::read_to_string("/proc/self/cgroup") {
+        if let Some(relative) = groups.lines().find_map(|line| line.strip_prefix("0::")) {
+            let mount = Path::new("/sys/fs/cgroup");
+            let mut current = mount.join(relative.trim_start_matches('/'));
+            loop {
+                let read_number = |name| {
+                    fs::read_to_string(current.join(name))
+                        .ok()?
+                        .trim()
+                        .parse::<u64>()
+                        .ok()
+                };
+                if let Some(used) = read_number("memory.current") {
+                    for name in ["memory.max", "memory.high"] {
+                        if let Some(limit) = read_number(name) {
+                            available = available.min(limit.saturating_sub(used) / (1024 * 1024));
+                        }
+                    }
+                }
+                if current == mount || !current.pop() {
+                    break;
+                }
+            }
         }
     }
-    32000
+    available
 }
 
 /// Count logical CPU cores by counting `processor` entries in `/proc/cpuinfo`.
@@ -611,14 +675,13 @@ fn read_mem_available_mb() -> u64 {
 /// Falls back to 1 when `/proc/cpuinfo` is unavailable (non-Linux systems).
 #[cfg(feature = "bam")]
 fn num_cpus() -> usize {
-    let Ok(f) = fs::File::open("/proc/cpuinfo") else {
-        return 1;
-    };
-    BufReader::new(f)
-        .lines()
-        .map_while(Result::ok)
-        .filter(|l| l.starts_with("processor"))
-        .count()
+    let affinity = std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1);
+    ["SLURM_CPUS_PER_TASK", "SLURM_CPUS_ON_NODE"]
+        .iter()
+        .filter_map(|name| std::env::var(name).ok()?.parse::<usize>().ok())
+        .fold(affinity, usize::min)
         .max(1)
 }
 
@@ -683,6 +746,7 @@ mod tests {
     // ── read_mem_available_mb ─────────────────────────────────────────────────
 
     #[test]
+    #[cfg(feature = "bam")]
     fn read_mem_available_mb_returns_nonzero_on_linux() {
         // /proc/meminfo exists on Linux; fallback is 32000 which is also valid
         let mb = read_mem_available_mb();
@@ -692,6 +756,7 @@ mod tests {
     // ── num_cpus ──────────────────────────────────────────────────────────────
 
     #[test]
+    #[cfg(feature = "bam")]
     fn num_cpus_returns_at_least_one() {
         assert!(num_cpus() >= 1);
     }
@@ -904,16 +969,19 @@ mod tests {
     // ── loom dtype validation ─────────────────────────────────────────────────
 
     #[test]
+    #[cfg(feature = "bam")]
     fn validate_loom_dtype_accepts_uint32() {
         assert!(validate_loom_dtype("uint32").is_ok());
     }
 
     #[test]
+    #[cfg(feature = "bam")]
     fn validate_loom_dtype_accepts_uint16() {
         assert!(validate_loom_dtype("uint16").is_ok());
     }
 
     #[test]
+    #[cfg(feature = "bam")]
     fn validate_loom_dtype_rejects_unknown() {
         // Typos and unsupported widths must be rejected, not silently coerced.
         for bad in ["uint8", "unit32", "float32", "u32", ""] {

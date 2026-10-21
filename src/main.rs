@@ -17,6 +17,7 @@ enum Commands {
     RunDropest(velocyto::commands::run_dropest::RunDropestArgs),
     RunSmartseq2(velocyto::commands::run_smartseq2::RunSmartseq2Args),
     DropestBcCorrect(velocyto::commands::dropest_bc_correct::DropestBcCorrectArgs),
+    WriteOutput(velocyto::commands::write_output::WriteOutputArgs),
 }
 
 fn main() -> anyhow::Result<()> {
@@ -27,6 +28,7 @@ fn main() -> anyhow::Result<()> {
         Commands::RunDropest(a) => a.verbose,
         Commands::RunSmartseq2(a) => a.verbose,
         Commands::DropestBcCorrect(a) => a.verbose,
+        Commands::WriteOutput(a) => a.verbose,
     };
     let level = if verbose {
         log::LevelFilter::Debug
@@ -42,5 +44,6 @@ fn main() -> anyhow::Result<()> {
         Commands::DropestBcCorrect(args) => {
             velocyto::commands::dropest_bc_correct::dropest_bc_correct(args)
         }
+        Commands::WriteOutput(args) => velocyto::commands::write_output::write_output(args),
     }
 }
