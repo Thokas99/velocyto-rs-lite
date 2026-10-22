@@ -30,10 +30,26 @@ fn main() {
     let gt = File::open(gt_path).unwrap();
     let rs = File::open(rs_path).unwrap();
 
-    let gt_acc = gt.dataset("row_attrs/Accession").unwrap().read_strings().unwrap();
-    let rs_acc = rs.dataset("row_attrs/Accession").unwrap().read_strings().unwrap();
-    let gt_cells = gt.dataset("col_attrs/CellID").unwrap().read_strings().unwrap();
-    let rs_cells = rs.dataset("col_attrs/CellID").unwrap().read_strings().unwrap();
+    let gt_acc = gt
+        .dataset("row_attrs/Accession")
+        .unwrap()
+        .read_strings()
+        .unwrap();
+    let rs_acc = rs
+        .dataset("row_attrs/Accession")
+        .unwrap()
+        .read_strings()
+        .unwrap();
+    let gt_cells = gt
+        .dataset("col_attrs/CellID")
+        .unwrap()
+        .read_strings()
+        .unwrap();
+    let rs_cells = rs
+        .dataset("col_attrs/CellID")
+        .unwrap()
+        .read_strings()
+        .unwrap();
 
     println!(
         "ground_truth: {} genes x {} cells | test: {} genes x {} cells",
@@ -44,21 +60,33 @@ fn main() {
     );
 
     // Row alignment: gt row i -> rs row index, keyed by Accession.
-    let rs_acc_idx: HashMap<&str, usize> =
-        rs_acc.iter().enumerate().map(|(i, a)| (a.as_str(), i)).collect();
+    let rs_acc_idx: HashMap<&str, usize> = rs_acc
+        .iter()
+        .enumerate()
+        .map(|(i, a)| (a.as_str(), i))
+        .collect();
     let gt_row_to_rs: Vec<usize> = gt_acc
         .iter()
-        .map(|a| *rs_acc_idx.get(a.as_str()).unwrap_or_else(|| panic!("accession {a} not in test")))
+        .map(|a| {
+            *rs_acc_idx
+                .get(a.as_str())
+                .unwrap_or_else(|| panic!("accession {a} not in test"))
+        })
         .collect();
 
     // Col alignment: gt col j -> rs col index, keyed by bare barcode.
-    let rs_bc_idx: HashMap<String, usize> =
-        rs_cells.iter().enumerate().map(|(i, c)| (bare_bc(c), i)).collect();
+    let rs_bc_idx: HashMap<String, usize> = rs_cells
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (bare_bc(c), i))
+        .collect();
     let gt_col_to_rs: Vec<usize> = gt_cells
         .iter()
         .map(|c| {
             let b = bare_bc(c);
-            *rs_bc_idx.get(&b).unwrap_or_else(|| panic!("barcode {b} not in test"))
+            *rs_bc_idx
+                .get(&b)
+                .unwrap_or_else(|| panic!("barcode {b} not in test"))
         })
         .collect();
 
@@ -103,7 +131,9 @@ fn main() {
     if total_mismatch == 0 {
         println!("\nRESULT: IDENTICAL ✓  (all layers bit-for-bit equal after alignment)");
     } else {
-        println!("\nRESULT: DIFFERENCES — {total_mismatch} mismatched cells, max abs diff {grand_max}");
+        println!(
+            "\nRESULT: DIFFERENCES — {total_mismatch} mismatched cells, max abs diff {grand_max}"
+        );
         std::process::exit(1);
     }
 }

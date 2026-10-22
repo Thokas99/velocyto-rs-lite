@@ -23,5 +23,6 @@ pub mod read;
 pub mod segment_match;
 pub mod serialization;
 pub mod speedboosted;
+pub(crate) mod telemetry;
 pub mod transcript_model;
 pub mod utils;

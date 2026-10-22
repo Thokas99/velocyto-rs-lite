@@ -6,8 +6,8 @@ rust-version = "1.89"
 description = "Faithful Rust translation of velocyto.py v0.17.16 — RNA velocity analysis for single-cell RNA-seq"
 license = "BSD-2-Clause"
 authors = ["Zhuoqing Fang"]
-repository = "https://github.com/zqfang/velocyto-rs"
-homepage = "https://github.com/zqfang/velocyto-rs"
+repository = "https://github.com/Thokas99/velocyto-rs-lite"
+homepage = "https://github.com/Thokas99/velocyto-rs-lite"
 readme = "README.md"
 keywords = ["bioinformatics", "single-cell", "rna-velocity", "rna-seq", "genomics"]
 categories = ["science", "command-line-utilities"]
@@ -21,6 +21,7 @@ include = [
     "/Cargo.toml",
     "/Cargo.lock",
     "/README.md",
+    "/README.full.md",
     "/LICENSE",
 ]
 

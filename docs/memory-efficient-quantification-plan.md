@@ -8,7 +8,7 @@ Quantify approximately 187,000 BD Rhapsody WTA cells from approximately two bill
 
 The reported Slurm termination near 150 GiB RSS is user-supplied evidence. No job log, BAM, GTF, cell whitelist, or phase-resolved memory trace was supplied. The allocations below are verified in source; attribution of the observed peak to any particular allocation remains a hypothesis. Later synthetic storage measurements are documented separately; no production performance improvement is claimed.
 
-Repository: `velocyto-rs-lite`, branch `feature/sparse-counting`, baseline HEAD `17df61dae812f132c5b955b55b6e6e3efc12a1b7`. At audit time GitNexus reported the indexed baseline commit, 804 symbols and 70 processes, with no incomplete-index reasons. Its generated prose still said 797 symbols. That graph snapshot predates implementation and is not a current impact report. Existing untracked `AGENTS.md` and `repomix-output.xml` were left untouched.
+Repository: `velocyto-rs-lite`, branch `feature/sparse-counting`, baseline HEAD `17df61dae812f132c5b955b55b6e6e3efc12a1b7`. At the initial audit, GitNexus reported the indexed baseline commit, 804 symbols and 70 processes; that graph predates implementation. The current `detect_changes --scope all` report identifies 71 changed symbols, 34 affected execution flows, and critical aggregate risk. Sort, count-stream, and annotation impacts have regression and differential coverage. The new untracked telemetry module is absent from that graph; local re-indexing was blocked because the MCP GitNexus process held the database. Existing untracked `AGENTS.md` and `repomix-output.xml` were left untouched.
 
 At audit time, baseline verification was blocked because `argmin` was not cached and `index.crates.io` was unreachable. The baseline was subsequently built and tested after dependencies became available; see the implementation record. Inspection of `hdf5-pure-rust 0.3.6` showed whole-chunk buffering, so the implementation uses a native HDF5 backend for slice writes.
 
@@ -47,7 +47,7 @@ Disk-backed sparse checkpoints are the durable source of truth. Neither a monoli
 
 ## Prioritized implementation and acceptance checks
 
-Each implementation step was tested before advancing. Run GitNexus impact on each edited symbol before future code edits, and complete non-partial `detect_changes(scope=all)` before any commit. The current checkout has not passed a final graph-change gate; no commit was made. No unrelated analysis-module rewrite is needed.
+Each implementation step was tested before advancing. Before any future code edits, run GitNexus impact on the edited symbols. The current graph report is not a clean gate: aggregate risk is critical and the new telemetry file is not indexed. No commit was made. No unrelated analysis-module rewrite is needed.
 
 ### P0. Establish correctness and measurement baselines
 

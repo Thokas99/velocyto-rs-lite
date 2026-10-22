@@ -6,6 +6,8 @@ use rand::Rng;
 use regex::Regex;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::BufRead;
+#[cfg(feature = "bam")]
+use std::time::Instant;
 
 use crate::constants::{LONGEST_INTRON_ALLOWED, PATCH_INDELS, PLACEHOLDER_UMI_LEN};
 use crate::feature::Feature;
@@ -61,6 +63,22 @@ pub enum UmiExtension {
     Gene,
     Nbp(usize),
     WithoutUmi,
+}
+
+#[cfg(feature = "bam")]
+#[derive(Clone, Copy)]
+pub(crate) struct CountProgress {
+    pub records_processed: u64,
+    pub completed_barcodes: u64,
+    pub completed_cells: u64,
+    pub active_barcodes: usize,
+    pub active_cells: usize,
+    pub active_records: usize,
+    pub estimated_read_bytes: usize,
+    pub estimated_dense_bytes: usize,
+    pub elapsed_seconds: f64,
+    pub cursor: u64,
+    pub batch_committed: bool,
 }
 
 impl ExInCounter {
@@ -369,6 +387,13 @@ impl ExInCounter {
         cigartuples: &[(u32, u32)],
         pos: i64,
     ) -> (Vec<(i64, i64)>, bool, i64, i64) {
+        Self::parse_cigar_ops(cigartuples.iter().copied(), pos)
+    }
+
+    fn parse_cigar_ops(
+        cigartuples: impl IntoIterator<Item = (u32, u32)>,
+        pos: i64,
+    ) -> (Vec<(i64, i64)>, bool, i64, i64) {
         let mut segments: Vec<(i64, i64)> = Vec::new();
         let mut hole_to_remove: std::collections::BTreeSet<usize> =
             std::collections::BTreeSet::new();
@@ -376,9 +401,13 @@ impl ExInCounter {
         let mut clip5: i64 = 0;
         let mut clip3: i64 = 0;
         let mut p = pos;
+        let mut cigar = cigartuples.into_iter().peekable();
+        let mut previous_op = None;
 
-        for (i, &(op, len)) in cigartuples.iter().enumerate() {
+        while let Some((op, len)) = cigar.next() {
             let length = len as i64;
+            let prev_ok = previous_op == Some(0);
+            let next_ok = cigar.peek().is_some_and(|(next_op, _)| *next_op == 0);
             match op {
                 0 => {
                     // BAM_CMATCH
@@ -393,8 +422,6 @@ impl ExInCounter {
                 2 => {
                     // BAM_CDEL
                     if length <= PATCH_INDELS {
-                        let prev_ok = i > 0 && cigartuples[i - 1].0 == 0;
-                        let next_ok = i + 1 < cigartuples.len() && cigartuples[i + 1].0 == 0;
                         if prev_ok && next_ok {
                             hole_to_remove.insert(segments.len().saturating_sub(1));
                         }
@@ -413,8 +440,6 @@ impl ExInCounter {
                 1 => {
                     // BAM_CINS
                     if length <= PATCH_INDELS {
-                        let prev_ok = i > 0 && cigartuples[i - 1].0 == 0;
-                        let next_ok = i + 1 < cigartuples.len() && cigartuples[i + 1].0 == 0;
                         if prev_ok && next_ok {
                             hole_to_remove.insert(segments.len().saturating_sub(1));
                         }
@@ -426,6 +451,7 @@ impl ExInCounter {
                 }
                 _ => {}
             }
+            previous_op = Some(op);
         }
 
         // Merge segments separated by small indels
@@ -749,6 +775,7 @@ impl ExInCounter {
             .into_iter()
             .map(|i| std::mem::take(&mut raw_lines[i]))
             .collect();
+        drop(raw_lines);
 
         let mut curr_chromstrand: Option<String> = None;
         let mut features: BTreeMap<String, TranscriptModel> = BTreeMap::new();
@@ -1019,11 +1046,8 @@ impl ExInCounter {
                 _ => continue,
             };
 
-            let cigar: Vec<(u32, u32)> = rec
-                .cigar()
-                .iter()
-                .filter_map(|op| op.ok())
-                .map(|op| {
+            let (segments, ref_skipped, clip5, clip3) = Self::parse_cigar_ops(
+                rec.cigar().iter().filter_map(|op| op.ok()).map(|op| {
                     let l = op.len() as u32;
                     match op.kind() {
                         Kind::Match => (0u32, l),
@@ -1034,9 +1058,9 @@ impl ExInCounter {
                         Kind::HardClip => (5u32, l),
                         _ => (255u32, l),
                     }
-                })
-                .collect();
-            let (segments, ref_skipped, clip5, clip3) = Self::parse_cigar_tuple(&cigar, pos);
+                }),
+                pos,
+            );
             if segments.is_empty() {
                 continue;
             }
@@ -1185,6 +1209,35 @@ impl ExInCounter {
             u64,
         ) -> anyhow::Result<()>,
     ) -> anyhow::Result<()> {
+        self.count_stream_with_progress(
+            bamfile,
+            multimap,
+            cell_batch_size,
+            start_offset,
+            max_batch_bytes,
+            None,
+            emit,
+        )
+    }
+
+    /// Count like `count_stream`, optionally reporting low-frequency progress.
+    #[cfg(feature = "bam")]
+    // Keep the existing public `count_stream` callback contract unchanged.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn count_stream_with_progress(
+        &mut self,
+        bamfile: &str,
+        multimap: bool,
+        cell_batch_size: usize,
+        start_offset: u64,
+        max_batch_bytes: usize,
+        mut progress: Option<&mut dyn FnMut(CountProgress) -> anyhow::Result<()>>,
+        mut emit: impl FnMut(
+            crate::count_checkpoint::DenseLayers,
+            Vec<String>,
+            u64,
+        ) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
         anyhow::ensure!(
             cell_batch_size > 0 && max_batch_bytes > 0,
             "counting limits must be positive"
@@ -1236,6 +1289,10 @@ impl ExInCounter {
         let mut reads_to_count: Vec<Read> = Vec::new();
         let mut nth = 0usize;
         let mut no_sample_tag_count = 0usize;
+        let mut records_processed = 0u64;
+        let mut completed_barcodes = 0u64;
+        let mut completed_cells = 0u64;
+        let count_started = Instant::now();
 
         let mut reader = std::fs::File::open(bamfile)
             .map(bam::io::Reader::new)
@@ -1267,7 +1324,32 @@ impl ExInCounter {
                             exhausted = true;
                             break;
                         }
-                        Ok(_) => {}
+                        Ok(_) => {
+                            if let Some(callback) = progress.as_mut() {
+                                records_processed = records_processed.saturating_add(1);
+                                if records_processed.is_multiple_of(100_000) {
+                                    let dense_bytes = self
+                                        .geneid2ix
+                                        .len()
+                                        .saturating_mul(cell_batch.len() + 1)
+                                        .saturating_mul(self.logic.layers().len())
+                                        .saturating_mul(8);
+                                    (**callback)(CountProgress {
+                                        records_processed,
+                                        completed_barcodes,
+                                        completed_cells,
+                                        active_barcodes: cell_batch_bcs.len(),
+                                        active_cells: cell_batch.len(),
+                                        active_records: reads_to_count.len(),
+                                        estimated_read_bytes: batch_bytes,
+                                        estimated_dense_bytes: dense_bytes,
+                                        elapsed_seconds: count_started.elapsed().as_secs_f64(),
+                                        cursor: next_record_offset,
+                                        batch_committed: false,
+                                    })?;
+                                }
+                            }
+                        }
                         Err(e) => return Err(anyhow::anyhow!("BAM read error: {e}")),
                     }
                     if rec.flags().is_unmapped() {
@@ -1351,11 +1433,8 @@ impl ExInCounter {
                         Some(Ok(p)) => p.get() as i64,
                         _ => continue,
                     };
-                    let cigar: Vec<(u32, u32)> = rec
-                        .cigar()
-                        .iter()
-                        .filter_map(|op| op.ok())
-                        .map(|op| {
+                    let (segments, ref_skipped, clip5, clip3) = Self::parse_cigar_ops(
+                        rec.cigar().iter().filter_map(|op| op.ok()).map(|op| {
                             let l = op.len() as u32;
                             match op.kind() {
                                 Kind::Match => (0u32, l),
@@ -1366,10 +1445,9 @@ impl ExInCounter {
                                 Kind::HardClip => (5u32, l),
                                 _ => (255u32, l),
                             }
-                        })
-                        .collect();
-                    let (segments, ref_skipped, clip5, clip3) =
-                        Self::parse_cigar_tuple(&cigar, pos);
+                        }),
+                        pos,
+                    );
                     if segments.is_empty() {
                         continue;
                     }
@@ -1408,6 +1486,16 @@ impl ExInCounter {
 
             if flush {
                 nth += 1;
+                let batch_raw_barcodes = cell_batch_bcs.len();
+                let batch_cells = cell_batch.len();
+                let batch_records = reads_to_count.len();
+                let batch_read_bytes = batch_bytes;
+                let batch_dense_bytes = self
+                    .geneid2ix
+                    .len()
+                    .saturating_mul(batch_cells)
+                    .saturating_mul(self.logic.layers().len())
+                    .saturating_mul(8);
                 debug!(
                     "Counting for batch {nth}, containing {} cells and {} reads",
                     cell_batch.len(),
@@ -1452,12 +1540,30 @@ impl ExInCounter {
                         *arr = arr.select(ndarray::Axis(1), &indices);
                     }
                 }
+                let emitted_cells = list_bcs.len();
                 emit(dict_layer_columns, list_bcs, next_record_offset)?;
+                completed_barcodes = completed_barcodes.saturating_add(batch_raw_barcodes as u64);
+                completed_cells = completed_cells.saturating_add(emitted_cells as u64);
+                if let Some(callback) = progress.as_mut() {
+                    (**callback)(CountProgress {
+                        records_processed,
+                        completed_barcodes,
+                        completed_cells,
+                        active_barcodes: batch_raw_barcodes,
+                        active_cells: emitted_cells,
+                        active_records: batch_records,
+                        estimated_read_bytes: batch_read_bytes,
+                        estimated_dense_bytes: batch_dense_bytes,
+                        elapsed_seconds: count_started.elapsed().as_secs_f64(),
+                        cursor: next_record_offset,
+                        batch_committed: true,
+                    })?;
+                }
                 batch_bytes = 0;
 
                 cell_batch.clear();
                 cell_batch_bcs.clear();
-                reads_to_count.clear();
+                reset_read_buffer(&mut reads_to_count, max_batch_bytes);
                 for fi in self.feature_indexes.values_mut() {
                     fi.reset();
                 }
@@ -2391,6 +2497,15 @@ fn aux_to_string(aux: noodles_sam::alignment::record::data::field::Value) -> Str
     }
 }
 
+#[cfg(feature = "bam")]
+fn reset_read_buffer(reads: &mut Vec<Read>, budget: usize) {
+    reads.clear();
+    // shortcut: retain at most 1/16 of the configured budget as empty Read slots; tune from production telemetry if allocation churn dominates.
+    if reads.capacity().saturating_mul(std::mem::size_of::<Read>()) > budget / 16 {
+        *reads = Vec::new();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2410,6 +2525,27 @@ mod tests {
         .unwrap()
     }
 
+    #[test]
+    fn streaming_cigar_parser_preserves_splice_indel_and_clip_semantics() {
+        let cigar = [
+            (4, 3),
+            (0, 10),
+            (1, 2),
+            (0, 5),
+            (3, 20),
+            (0, 6),
+            (2, 1),
+            (0, 4),
+            (4, 8),
+        ];
+        let expected = (vec![(103, 117), (138, 148)], true, 3, 8);
+        assert_eq!(ExInCounter::parse_cigar_tuple(&cigar, 100), expected);
+        assert_eq!(
+            ExInCounter::parse_cigar_ops(cigar.into_iter(), 100),
+            expected
+        );
+    }
+
     // ── default tag names ─────────────────────────────────────────────────────
 
     #[test]
@@ -2420,6 +2556,21 @@ mod tests {
     #[test]
     fn exincounter_default_ub_tag_is_ub() {
         assert_eq!(make_counter().umibarcode_str, "UB");
+    }
+
+    #[cfg(feature = "bam")]
+    #[test]
+    fn read_batch_buffer_releases_only_large_high_water_capacity() {
+        let budget = 16 * 1024 * 1024;
+        let keep_limit = budget / 16;
+        let mut large = Vec::<Read>::with_capacity(keep_limit / std::mem::size_of::<Read>() + 1);
+        assert!(large.capacity() * std::mem::size_of::<Read>() > keep_limit);
+        reset_read_buffer(&mut large, budget);
+        assert_eq!(large.capacity() * std::mem::size_of::<Read>(), 0);
+
+        let mut small = Vec::<Read>::with_capacity(4);
+        reset_read_buffer(&mut small, budget);
+        assert!(small.capacity() >= 4);
     }
 
     // ── explicit tag override ─────────────────────────────────────────────────

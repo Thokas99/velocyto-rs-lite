@@ -27,6 +27,7 @@ use noodles_bam as bam;
 use noodles_bgzf as bgzf;
 use noodles_sam::alignment::io::Write as _;
 use noodles_sam::alignment::record::data::field::Tag;
+use noodles_sam::alignment::record_buf::data::field::value::Array;
 use noodles_sam::alignment::record_buf::data::field::Value;
 use noodles_sam::alignment::RecordBuf;
 
@@ -55,14 +56,38 @@ fn extract_key(record: &RecordBuf, tag: &Tag) -> SortKey {
     }
 }
 
-/// Rough resident-memory estimate for one record, used only to bound a chunk to
-/// the `-m` budget. The dominant variable cost is the sequence plus its quality
-/// scores (both ~one byte per base); the constant covers struct/Vec overhead,
-/// name, cigar, and aux data. Order-of-magnitude accuracy is sufficient.
-fn record_footprint(record: &RecordBuf) -> usize {
+/// Conservative payload estimate for a record and its cached sort key.
+fn record_footprint(record: &RecordBuf, tag: &Tag) -> usize {
     let name = record.name().map_or(0, |n| n.len());
     let seq = record.sequence().len();
-    256 + name + 2 * seq
+    let cigar = record.cigar().as_ref().len().saturating_mul(16);
+    let aux = record.data().iter().fold(0usize, |n, (_, value)| {
+        let payload = match value {
+            Value::String(s) | Value::Hex(s) => s.len(),
+            Value::Array(a) => match a {
+                Array::Int8(v) => v.len(),
+                Array::UInt8(v) => v.len(),
+                Array::Int16(v) => v.len().saturating_mul(2),
+                Array::UInt16(v) => v.len().saturating_mul(2),
+                Array::Int32(v) => v.len().saturating_mul(4),
+                Array::UInt32(v) => v.len().saturating_mul(4),
+                Array::Float(v) => v.len().saturating_mul(4),
+            },
+            _ => 8,
+        };
+        n.saturating_add(payload).saturating_add(32)
+    });
+    let key = match record.data().get(tag) {
+        Some(Value::String(s)) => s.len(),
+        Some(Value::Character(_)) => 1,
+        _ => 0,
+    };
+    512usize
+        .saturating_add(name)
+        .saturating_add(seq.saturating_mul(2))
+        .saturating_add(cigar)
+        .saturating_add(aux)
+        .saturating_add(key)
 }
 
 /// Build a BAM writer whose BGZF stream uses compression level `BAM_COMPRESSION`
@@ -128,13 +153,33 @@ impl PartialOrd for HeapEntry {
 /// Uses an external (disk-spilling) k-way merge so inputs larger than RAM sort
 /// correctly. `mem_budget_mb` bounds the resident memory of each in-memory chunk
 /// (mirrors samtools `-m`); `threads` controls the rayon sort parallelism. Temp
-/// Spill files live persistently in `output`'s parent directory, including on failure.
+/// spill files are removed when this call returns; the pipeline wrapper keeps
+/// interruption state in a separate validated work directory.
 pub fn sort_bam_by_tag(
     input: &Path,
     output: &Path,
     tag: &str,
     mem_budget_mb: usize,
     threads: usize,
+) -> anyhow::Result<()> {
+    let out_parent = output
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let tempdir = tempfile::Builder::new()
+        .prefix("cellsort_tmp_")
+        .tempdir_in(out_parent)
+        .with_context(|| format!("creating spill temp dir in {}", out_parent.display()))?;
+    sort_bam_by_tag_with_spill_dir(input, output, tag, mem_budget_mb, threads, tempdir.path())
+}
+
+fn sort_bam_by_tag_with_spill_dir(
+    input: &Path,
+    output: &Path,
+    tag: &str,
+    mem_budget_mb: usize,
+    threads: usize,
+    spill_dir: &Path,
 ) -> anyhow::Result<()> {
     anyhow::ensure!(
         tag.len() == 2,
@@ -160,16 +205,10 @@ pub fn sort_bam_by_tag(
         .build()
         .context("building rayon thread pool for BAM sort")?;
 
-    let out_parent = output
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-
     // ── Spill phase ───────────────────────────────────────────────────────────
     let mut record = RecordBuf::default();
     let mut chunk: Vec<RecordBuf> = Vec::new();
     let mut spilled: Vec<std::path::PathBuf> = Vec::new();
-    let mut tmpdir: Option<std::path::PathBuf> = None;
     let mut eof = false;
 
     loop {
@@ -183,7 +222,7 @@ pub fn sort_bam_by_tag(
                 eof = true;
                 break;
             }
-            chunk_bytes += record_footprint(&record);
+            chunk_bytes = chunk_bytes.saturating_add(record_footprint(&record, &tag));
             chunk.push(std::mem::take(&mut record));
             if chunk_bytes >= budget_bytes {
                 break;
@@ -213,21 +252,9 @@ pub fn sort_bam_by_tag(
         // Otherwise spill this chunk (skip an empty trailing chunk at EOF).
         if !chunk.is_empty() {
             pool.install(|| chunk.par_sort_by_cached_key(|r| extract_key(r, &tag)));
-            if tmpdir.is_none() {
-                tmpdir = Some(
-                    tempfile::Builder::new()
-                        .prefix("cellsort_tmp_")
-                        .tempdir_in(out_parent)
-                        .with_context(|| {
-                            format!("creating spill temp dir in {}", out_parent.display())
-                        })?
-                        .keep(),
-                );
-            }
-            let path = tmpdir
-                .as_ref()
-                .unwrap()
-                .join(format!("chunk_{}.bam", spilled.len()));
+            std::fs::create_dir_all(spill_dir)
+                .with_context(|| format!("creating spill directory {}", spill_dir.display()))?;
+            let path = spill_dir.join(format!("chunk_{}.bam", spilled.len()));
             let mut writer = level7_bam_writer(
                 File::create(&path)
                     .with_context(|| format!("creating spill chunk {}", path.display()))?,
@@ -244,13 +271,6 @@ pub fn sort_bam_by_tag(
             finish_bam(writer).with_context(|| "finalizing spill chunk")?;
             File::open(&path)?.sync_all()?;
             spilled.push(path);
-            let manifest = tmpdir.as_ref().unwrap().join("sort-runs.json");
-            let partial = manifest.with_extension("partial");
-            let mut receipt = File::create(&partial)?;
-            serde_json::to_writer(&mut receipt, &spilled)?;
-            receipt.sync_all()?;
-            std::fs::rename(partial, manifest)?;
-            File::open(tmpdir.as_ref().unwrap())?.sync_all()?;
         }
 
         if eof {
@@ -265,10 +285,7 @@ pub fn sort_bam_by_tag(
     while spilled.len() > FAN_IN {
         let mut next = Vec::new();
         for (i, runs) in spilled.chunks(FAN_IN).enumerate() {
-            let path = tmpdir
-                .as_ref()
-                .unwrap()
-                .join(format!("merge_{pass}_{i}.bam"));
+            let path = spill_dir.join(format!("merge_{pass}_{i}.bam"));
             merge_runs(runs, &path, &header, &tag, threads)?;
             File::open(&path)?.sync_all()?;
             next.push(path);
@@ -277,10 +294,6 @@ pub fn sort_bam_by_tag(
         pass += 1;
     }
     merge_runs(&spilled, output, &header, &tag, threads)?;
-    log::info!(
-        "Sort spill files retained at {}",
-        tmpdir.as_ref().unwrap().display()
-    );
     Ok(())
 }
 
@@ -350,7 +363,7 @@ fn merge_runs(
     Ok(())
 }
 
-/// Reuse only a published, input-bound sort; incomplete files are retained.
+/// Reuse a completed sort or restart safely from the source BAM.
 pub fn prepare_sorted_bam(
     input: &Path,
     output: &Path,
@@ -359,6 +372,7 @@ pub fn prepare_sorted_bam(
     threads: usize,
 ) -> anyhow::Result<()> {
     use crate::count_checkpoint::InputIdentity;
+
     #[derive(serde::Serialize, serde::Deserialize, PartialEq, Eq)]
     struct Receipt {
         version: u32,
@@ -366,6 +380,16 @@ pub fn prepare_sorted_bam(
         output: InputIdentity,
         tag: String,
     }
+
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct SortState {
+        version: u32,
+        input: InputIdentity,
+        tag: String,
+        output_bytes: Option<u64>,
+        output_modified_ns: Option<u128>,
+    }
+
     let receipt_path = output.with_extension("bam.sort.json");
     let lock = std::fs::OpenOptions::new()
         .read(true)
@@ -376,62 +400,212 @@ pub fn prepare_sorted_bam(
     lock.try_lock()
         .context("another process is sorting this BAM")?;
     let input_identity = InputIdentity::read(input)?;
+    let work_dir = output.with_extension("bam.sort-work");
+    let state_path = work_dir.join("sort-state.json");
+    let state_partial = work_dir.join("sort-state.partial");
+    let staged = work_dir.join("sorted.bam");
+    let parent = output
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+
     if output.exists() {
-        let receipt_file = File::open(&receipt_path).with_context(|| format!(
-            "Unverified sorted BAM {}; retained unchanged. Move it aside before sorting, or resume from an existing counting checkpoint using write-output", output.display()))?;
+        if receipt_path.exists() {
+            let receipt: Receipt = read_json_bounded(&receipt_path)?;
+            anyhow::ensure!(
+                receipt
+                    == Receipt {
+                        version: 1,
+                        input: input_identity.clone(),
+                        output: InputIdentity::read(output)?,
+                        tag: tag.into()
+                    },
+                "sorted BAM provenance differs; retained unchanged"
+            );
+            cleanup_owned_sort_work(&work_dir, &input_identity, tag);
+            return Ok(());
+        }
+
+        let state: SortState = read_json_bounded(&state_path).with_context(|| format!(
+            "Unverified sorted BAM {}; retained unchanged. Move it aside before sorting, or resume from an existing counting checkpoint using write-output",
+            output.display()
+        ))?;
         anyhow::ensure!(
-            receipt_file.metadata()?.len() <= 1_048_576,
-            "sort receipt too large"
-        );
-        let receipt: Receipt = serde_json::from_reader(receipt_file)?;
-        anyhow::ensure!(
-            receipt
-                == Receipt {
-                    version: 1,
-                    input: input_identity,
-                    output: InputIdentity::read(output)?,
-                    tag: tag.into()
-                },
+            state.version == 1
+                && state.input == input_identity
+                && state.tag == tag
+                && state.output_bytes == Some(std::fs::metadata(output)?.len())
+                && state.output_modified_ns == Some(InputIdentity::read(output)?.modified_ns),
             "sorted BAM provenance differs; retained unchanged"
         );
+        write_sort_receipt(&receipt_path, &input_identity, output, tag)?;
+        cleanup_owned_sort_work(&work_dir, &input_identity, tag);
         return Ok(());
     }
-    let name = output
-        .file_name()
-        .context("sorted BAM needs a filename")?
-        .to_string_lossy();
-    let partial = output.with_file_name(format!("{name}.partial-{:016x}", rand::random::<u64>()));
-    sort_bam_by_tag(input, &partial, tag, memory_mb, threads).with_context(|| {
-        format!(
-            "Sort failed; intermediate files and {} retained",
-            partial.display()
-        )
-    })?;
-    File::open(&partial)?.sync_all()?;
-    std::fs::rename(&partial, output)?;
-    let receipt = Receipt {
+
+    if work_dir.exists() {
+        if !std::fs::symlink_metadata(&work_dir)?.file_type().is_dir() {
+            anyhow::bail!(
+                "sort work path exists and is not a directory: {}",
+                work_dir.display()
+            );
+        }
+        if state_path.exists() {
+            let state: SortState = read_json_bounded(&state_path)?;
+            anyhow::ensure!(
+                state.version == 1 && state.input == input_identity && state.tag == tag,
+                "sort work directory belongs to different inputs; retained unchanged"
+            );
+            if let (Some(bytes), Some(modified_ns)) = (state.output_bytes, state.output_modified_ns)
+            {
+                anyhow::ensure!(
+                    matches_file_stamp(&staged, bytes, modified_ns)?,
+                    "completed staged BAM is missing or changed; retained unchanged"
+                );
+                std::fs::rename(&staged, output)?;
+                File::open(parent)?.sync_all()?;
+                write_sort_receipt(&receipt_path, &input_identity, output, tag)?;
+                cleanup_owned_sort_work(&work_dir, &input_identity, tag);
+                return Ok(());
+            }
+        } else if std::fs::read_dir(&work_dir)?.next().is_some() {
+            anyhow::bail!(
+                "unmarked sort work directory exists; retained unchanged: {}",
+                work_dir.display()
+            );
+        }
+        std::fs::remove_dir_all(&work_dir)?;
+    }
+    if receipt_path.exists() {
+        std::fs::remove_file(&receipt_path)?;
+    }
+
+    std::fs::create_dir(&work_dir)?;
+    let mut state = SortState {
         version: 1,
-        input: input_identity,
-        output: InputIdentity::read(output)?,
+        input: input_identity.clone(),
         tag: tag.into(),
+        output_bytes: None,
+        output_modified_ns: None,
     };
-    let partial_receipt =
-        receipt_path.with_extension(format!("partial-{:016x}", rand::random::<u64>()));
+    write_sort_state(&state_path, &state_partial, &state)?;
+    if let Err(error) = sort_bam_by_tag_with_spill_dir(
+        input,
+        &staged,
+        tag,
+        memory_mb,
+        threads,
+        &work_dir.join("spills"),
+    ) {
+        let _ = std::fs::remove_dir_all(&work_dir);
+        return Err(error).context("sorting BAM by barcode");
+    }
+    File::open(&staged)?.sync_all()?;
+    let staged_identity = InputIdentity::read(&staged)?;
+    state.output_bytes = Some(staged_identity.bytes);
+    state.output_modified_ns = Some(staged_identity.modified_ns);
+    write_sort_state(&state_path, &state_partial, &state)?;
+    std::fs::rename(&staged, output)?;
+    File::open(parent)?.sync_all()?;
+    write_sort_receipt(&receipt_path, &input_identity, output, tag)?;
+    cleanup_owned_sort_work(&work_dir, &input_identity, tag);
+    Ok(())
+}
+
+fn read_json_bounded<T: serde::de::DeserializeOwned>(path: &Path) -> anyhow::Result<T> {
+    let file = File::open(path)?;
+    anyhow::ensure!(file.metadata()?.len() <= 1_048_576, "sort state too large");
+    Ok(serde_json::from_reader(file)?)
+}
+
+fn matches_file_stamp(path: &Path, bytes: u64, modified_ns: u128) -> anyhow::Result<bool> {
+    match crate::count_checkpoint::InputIdentity::read(path) {
+        Ok(identity) => Ok(identity.bytes == bytes && identity.modified_ns == modified_ns),
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            Ok(false)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn write_sort_state(
+    path: &Path,
+    partial: &Path,
+    state: &impl serde::Serialize,
+) -> anyhow::Result<()> {
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(partial)?;
+    serde_json::to_writer(&mut file, state)?;
+    file.sync_all()?;
+    std::fs::rename(partial, path)?;
+    File::open(path.parent().unwrap_or(Path::new(".")))?.sync_all()?;
+    Ok(())
+}
+
+fn write_sort_receipt(
+    path: &Path,
+    input: &crate::count_checkpoint::InputIdentity,
+    output: &Path,
+    tag: &str,
+) -> anyhow::Result<()> {
+    #[derive(serde::Serialize)]
+    struct Receipt<'a> {
+        version: u32,
+        input: &'a crate::count_checkpoint::InputIdentity,
+        output: crate::count_checkpoint::InputIdentity,
+        tag: &'a str,
+    }
+
+    let parent = path.parent().unwrap_or(Path::new("."));
+    let partial = path.with_extension(format!("partial-{:016x}", rand::random::<u64>()));
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
-        .open(&partial_receipt)?;
-    serde_json::to_writer(&mut file, &receipt)?;
+        .open(&partial)?;
+    serde_json::to_writer(
+        &mut file,
+        &Receipt {
+            version: 1,
+            input,
+            output: crate::count_checkpoint::InputIdentity::read(output)?,
+            tag,
+        },
+    )?;
     file.sync_all()?;
-    std::fs::rename(partial_receipt, receipt_path)?;
-    File::open(
-        output
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or(Path::new(".")),
-    )?
-    .sync_all()?;
+    std::fs::rename(partial, path)?;
+    File::open(parent)?.sync_all()?;
     Ok(())
+}
+
+fn cleanup_owned_sort_work(
+    work_dir: &Path,
+    input: &crate::count_checkpoint::InputIdentity,
+    tag: &str,
+) {
+    #[derive(serde::Deserialize)]
+    struct SortState {
+        version: u32,
+        input: crate::count_checkpoint::InputIdentity,
+        tag: String,
+    }
+    let state_path = work_dir.join("sort-state.json");
+    if let Ok(state) = read_json_bounded::<SortState>(&state_path) {
+        if state.version == 1 && state.input == *input && state.tag == tag {
+            if let Err(error) = std::fs::remove_dir_all(work_dir) {
+                log::warn!(
+                    "Could not remove completed sort work {}: {error}",
+                    work_dir.display()
+                );
+            }
+        }
+    }
 }
 
 #[cfg(all(test, feature = "bam"))]
@@ -440,7 +614,7 @@ mod tests {
     use noodles_sam as sam;
 
     #[test]
-    fn failed_merge_keeps_spill_files() {
+    fn failed_merge_cleans_spill_files() {
         let dir = tempfile::tempdir().unwrap();
         let input = dir.path().join("in.bam");
         write_bam(
@@ -450,17 +624,94 @@ mod tests {
         let output = dir.path().join("is-a-directory");
         std::fs::create_dir(&output).unwrap();
         assert!(sort_bam_by_tag(&input, &output, "CB", 0, 1).is_err());
-        let retained: Vec<_> = std::fs::read_dir(dir.path())
+        assert!(std::fs::read_dir(dir.path())
             .unwrap()
             .flatten()
-            .filter(|e| e.file_name().to_string_lossy().starts_with("cellsort_tmp_"))
-            .collect();
-        assert_eq!(
-            retained.len(),
-            1,
-            "failed sorts must retain their spill directory"
-        );
-        assert!(std::fs::read_dir(retained[0].path()).unwrap().count() >= 3);
+            .all(|e| !e.file_name().to_string_lossy().starts_with("cellsort_tmp_")));
+    }
+
+    #[test]
+    fn publishes_a_completed_staged_sort_after_interruption() {
+        use crate::count_checkpoint::InputIdentity;
+
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.bam");
+        let output = dir.path().join("out.bam");
+        let work = output.with_extension("bam.sort-work");
+        let staged = work.join("sorted.bam");
+        write_bam(&input, &[("r0", Some("b")), ("r1", Some("a"))]);
+        std::fs::create_dir_all(&work).unwrap();
+        sort_bam_by_tag(&input, &staged, "CB", 0, 1).unwrap();
+        let input_id = InputIdentity::read(&input).unwrap();
+        let staged_id = InputIdentity::read(&staged).unwrap();
+        std::fs::write(
+            work.join("sort-state.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "version": 1,
+                "input": input_id,
+                "tag": "CB",
+                "output_bytes": staged_id.bytes,
+                "output_modified_ns": staged_id.modified_ns
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        prepare_sorted_bam(&input, &output, "CB", 1, 1).unwrap();
+
+        assert_eq!(read_keys(&output).len(), 2);
+        assert!(output.with_extension("bam.sort.json").exists());
+        assert!(!work.exists());
+    }
+
+    #[test]
+    fn retries_cleanly_after_an_interrupted_sort() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.bam");
+        let output = dir.path().join("out.bam");
+        let work = output.with_extension("bam.sort-work");
+        write_bam(&input, &[("r0", Some("b")), ("r1", Some("a"))]);
+        std::fs::create_dir_all(work.join("spills")).unwrap();
+        std::fs::write(work.join("spills/chunk_0.bam"), b"incomplete").unwrap();
+        std::fs::write(
+            work.join("sort-state.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "version": 1,
+                "input": crate::count_checkpoint::InputIdentity::read(&input).unwrap(),
+                "tag": "CB",
+                "output_bytes": null,
+                "output_modified_ns": null
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        prepare_sorted_bam(&input, &output, "CB", 1, 1).unwrap();
+
+        assert_eq!(read_keys(&output).len(), 2);
+        assert!(!work.exists());
+    }
+
+    #[test]
+    fn sort_budget_estimate_includes_cigar_and_aux_payloads() {
+        use noodles_sam::alignment::record::cigar::{op::Kind, Op};
+
+        let tag = cb_tag();
+        let mut small = RecordBuf::default();
+        small.data_mut().insert(tag, Value::String("CB".into()));
+        small.cigar_mut().as_mut().push(Op::new(Kind::Match, 10));
+
+        let mut large = RecordBuf::default();
+        large
+            .data_mut()
+            .insert(tag, Value::String("C".repeat(4096).into()));
+        large.cigar_mut().as_mut().extend([
+            Op::new(Kind::Match, 10),
+            Op::new(Kind::Skip, 20),
+            Op::new(Kind::Match, 10),
+        ]);
+
+        assert!(record_footprint(&large, &tag) >= record_footprint(&small, &tag) + 4096);
     }
 
     #[test]

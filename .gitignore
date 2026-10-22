@@ -33,8 +33,6 @@ build
 # dist
 dist/*
 dist
-tests/*
-tests
 # mypy
 .mypy_cache/*
 
@@ -117,3 +115,15 @@ flamegraph.svg
 lcov.info
 tarpaulin-report.html
 cobertura.xml
+
+# Local binaries, benchmark packages, and generated repository snapshots
+/artifacts/
+/repomix-output.xml
+
+# Runtime output and recoverable work state
+*.jsonl
+*.log
+*.partial
+*.counts/
+cellsort_tmp_*/
+*.bam.sort-work/

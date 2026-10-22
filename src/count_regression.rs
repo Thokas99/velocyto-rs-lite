@@ -1,12 +1,11 @@
 use crate::{counter::ExInCounter, logic::logic_from_name};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     io::Cursor,
     path::Path,
 };
 
 pub(crate) fn fixture(dir: &Path) -> (String, String) {
-    use noodles_sam::alignment::io::Write;
     let gtf = dir.join("genes.gtf");
     std::fs::write(&gtf, concat!(
         "chr1\ttest\texon\t100\t199\t.\t+\t.\tgene_id \"G1\"; transcript_id \"T1\"; gene_name \"Gene1\"; exon_number \"1\";\n",
@@ -29,10 +28,16 @@ pub(crate) fn fixture(dir: &Path) -> (String, String) {
             sam.push_str(&format!("r{cell}{i}\t0\tchr1\t{pos}\t255\t{cigar}\t*\t0\t0\t*\t*\tCB:Z:{cell}\tMA:Z:{umi}\tNH:i:1\tST:Z:S1\n"));
         }
     }
+    let bam = dir.join("cellsorted.bam");
+    write_bam(&bam, &sam);
+    (bam.to_string_lossy().into(), gtf.to_string_lossy().into())
+}
+
+fn write_bam(path: &Path, sam: &str) {
+    use noodles_sam::alignment::io::Write;
     let mut reader = noodles_sam::io::Reader::new(Cursor::new(sam));
     let header = reader.read_header().unwrap();
-    let bam = dir.join("cellsorted.bam");
-    let mut writer = noodles_bam::io::Writer::new(std::fs::File::create(&bam).unwrap());
+    let mut writer = noodles_bam::io::Writer::new(std::fs::File::create(path).unwrap());
     writer.write_header(&header).unwrap();
     for record in reader.record_bufs(&header) {
         writer
@@ -40,7 +45,39 @@ pub(crate) fn fixture(dir: &Path) -> (String, String) {
             .unwrap();
     }
     writer.try_finish().unwrap();
-    (bam.to_string_lossy().into(), gtf.to_string_lossy().into())
+}
+
+fn high_depth_fixture(dir: &Path) -> (String, String) {
+    let (bam, gtf) = fixture(dir);
+    let mut sam = String::from("@HD\tVN:1.6\tSO:coordinate\n@SQ\tSN:chr1\tLN:1000\n");
+    for umi in 0..100 {
+        for read in 0..100 {
+            sam.push_str(&format!(
+                "r{umi}_{read}\t0\tchr1\t120\t255\t30M\t*\t0\t0\t*\t*\tCB:Z:a\tMA:Z:u{umi}\tNH:i:1\tST:Z:S1\n"
+            ));
+        }
+    }
+    for read in 0..90_000 {
+        sam.push_str(&format!(
+            "excluded{read}\t0\tchr1\t120\t255\t30M\t*\t0\t0\t*\t*\tCB:Z:z\tMA:Z:outside\tNH:i:1\tST:Z:S1\n"
+        ));
+    }
+    write_bam(Path::new(&bam), &sam);
+    (bam, gtf)
+}
+
+fn tag_edge_fixture(dir: &Path) -> (String, String) {
+    let (bam, gtf) = fixture(dir);
+    let sam = concat!(
+        "@HD\tVN:1.6\tSO:coordinate\n@SQ\tSN:chr1\tLN:1000\n",
+        "valid\t0\tchr1\t120\t255\t30M\t*\t0\t0\t*\t*\tCB:Z:a\tMA:Z:valid\tNH:i:1\tST:Z:S1\n",
+        "missing_cb\t0\tchr1\t120\t255\t30M\t*\t0\t0\t*\t*\tMA:Z:no_cb\tNH:i:1\tST:Z:S1\n",
+        "missing_umi\t0\tchr1\t120\t255\t30M\t*\t0\t0\t*\t*\tCB:Z:a\tNH:i:1\tST:Z:S1\n",
+        "typed_cb\t0\tchr1\t120\t255\t30M\t*\t0\t0\t*\t*\tCB:i:1\tMA:Z:typed_cb\tNH:i:1\tST:Z:S1\n",
+        "typed_umi\t0\tchr1\t120\t255\t30M\t*\t0\t0\t*\t*\tCB:Z:a\tMA:i:3\tNH:i:1\tST:Z:S1\n",
+    );
+    write_bam(Path::new(&bam), sam);
+    (bam, gtf)
 }
 
 fn counter(gtf: &str, bam: &str, logic: &str) -> ExInCounter {
@@ -60,6 +97,79 @@ fn counter(gtf: &str, bam: &str, logic: &str) -> ExInCounter {
     c.read_transcriptmodels(gtf).unwrap();
     c.mark_up_introns(bam, false).unwrap();
     c
+}
+
+fn unique_ids(file: &hdf5::File, path: &str) -> Vec<String> {
+    let values = file
+        .dataset(path)
+        .unwrap()
+        .read_raw::<hdf5::types::VarLenUnicode>()
+        .unwrap();
+    let values: Vec<_> = values.iter().map(ToString::to_string).collect();
+    assert_eq!(
+        values.iter().collect::<HashSet<_>>().len(),
+        values.len(),
+        "{path} must be unique"
+    );
+    values
+}
+
+fn read_h5ad_counts(path: &Path, layer: &str) -> BTreeMap<String, BTreeMap<String, u32>> {
+    let file = hdf5::File::open(path).unwrap();
+    let ids = unique_ids(&file, "obs/_index");
+    let genes = unique_ids(&file, "var/Accession");
+    let ptr = file
+        .dataset(&format!("layers/{layer}/indptr"))
+        .unwrap()
+        .read_raw::<i64>()
+        .unwrap();
+    let indices = file
+        .dataset(&format!("layers/{layer}/indices"))
+        .unwrap()
+        .read_raw::<i32>()
+        .unwrap();
+    let data = file
+        .dataset(&format!("layers/{layer}/data"))
+        .unwrap()
+        .read_raw::<u32>()
+        .unwrap();
+    assert_eq!(ptr.len(), ids.len() + 1);
+    assert_eq!(indices.len(), data.len());
+    let mut result = BTreeMap::new();
+    for (cell, id) in ids.into_iter().enumerate() {
+        let mut row = BTreeMap::new();
+        for i in usize::try_from(ptr[cell]).unwrap()..usize::try_from(ptr[cell + 1]).unwrap() {
+            let gene = genes.get(usize::try_from(indices[i]).unwrap()).unwrap();
+            assert!(
+                row.insert(gene.clone(), data[i]).is_none(),
+                "duplicate sparse gene entry"
+            );
+        }
+        assert!(result.insert(id, row).is_none(), "duplicate CellID");
+    }
+    result
+}
+
+fn read_loom_counts(path: &Path, layer: &str) -> BTreeMap<String, BTreeMap<String, u32>> {
+    let file = hdf5::File::open(path).unwrap();
+    let ids = unique_ids(&file, "col_attrs/CellID");
+    let genes = unique_ids(&file, "row_attrs/Accession");
+    let dataset = file.dataset(&format!("layers/{layer}")).unwrap();
+    assert_eq!(dataset.shape(), [genes.len(), ids.len()]);
+    let values = dataset.read_raw::<u32>().unwrap();
+    let n_cells = ids.len();
+    let mut result = BTreeMap::new();
+    for (cell, id) in ids.into_iter().enumerate() {
+        let mut row = BTreeMap::new();
+        for (gene, accession) in genes.iter().enumerate() {
+            let value = values[gene * n_cells + cell];
+            if value != 0 {
+                row.insert(accession.clone(), value);
+            }
+        }
+        assert!(result.insert(id, row).is_none(), "duplicate CellID");
+    }
+    result
 }
 
 #[test]
@@ -163,6 +273,7 @@ fn cli_checkpoint_resume_and_output_only_without_inputs() {
     let whitelist = dir.path().join("barcodes.txt");
     std::fs::write(&whitelist, "a\nb\nc\n").unwrap();
     let folder = dir.path().join("out");
+    let telemetry = dir.path().join("telemetry.jsonl");
     let args = vec![
         "cmd",
         &bam,
@@ -183,8 +294,29 @@ fn cli_checkpoint_resume_and_output_only_without_inputs() {
         "1",
         "--cell-batch-size",
         "1",
+        "--telemetry-jsonl",
+        telemetry.to_str().unwrap(),
     ];
     crate::commands::run::run(Cli::parse_from(&args).args).unwrap();
+    let events: Vec<serde_json::Value> = std::fs::read_to_string(&telemetry)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(events.iter().any(|e| e["phase"] == "bam_sort"));
+    assert!(events.iter().any(|e| e["phase"] == "counting"));
+    assert!(events.iter().any(|e| e["event"] == "checkpoint_commit"));
+    assert!(events.iter().any(|e| e["event"] == "run_complete"));
+    let commit = events
+        .iter()
+        .find(|e| e["event"] == "checkpoint_commit")
+        .unwrap();
+    assert!(commit["batch_size"]["records"].is_number());
+    assert!(commit["estimated_batch_memory_bytes"]["read_batch"].is_number());
+    assert!(commit["estimated_batch_memory_bytes"]["dense_scratch"].is_number());
+    assert!(events
+        .iter()
+        .all(|e| e["rss_kib"].is_number() && e["peak_rss_kib"].is_number()));
     let root = folder.join("test.counts");
     let original = crate::count_checkpoint::Checkpoint::open(&root).unwrap();
     assert!(original.manifest.complete());
@@ -326,30 +458,88 @@ fn fresh_counter_resumes_second_bam_with_interleaved_samples() {
 #[test]
 #[ignore = "requires VELOCYTO_REFERENCE_BIN pointing to the original 17df61d executable"]
 fn differential_against_original_cli() {
+    use clap::Parser;
     let executable = std::env::var("VELOCYTO_REFERENCE_BIN").expect("set VELOCYTO_REFERENCE_BIN");
     let root = tempfile::tempdir().unwrap();
-    let (bam, gtf) = fixture(root.path());
-    let whitelist = root.path().join("barcodes.txt");
-    std::fs::write(&whitelist, "a\nb\nc\n").unwrap();
-    for logic in [
+    type FixtureFn = fn(&Path) -> (String, String);
+    let cases: [(&str, FixtureFn); 3] = [
+        ("core", fixture),
+        ("high-depth", high_depth_fixture),
+        ("tag-edges", tag_edge_fixture),
+    ];
+    let logics = [
         "Default",
+        "Permissive10X",
         "Intermediate10X",
         "ValidatedIntrons10X",
         "Stricter10X",
         "ObservedSpanning10X",
         "Discordant10X",
         "SmartSeq2",
-    ] {
-        let out = root.path().join(logic);
-        let result = std::process::Command::new(&executable)
-            .args([
-                "run",
+    ];
+    for (case, make_fixture) in cases {
+        let case_dir = root.path().join(case);
+        std::fs::create_dir_all(&case_dir).unwrap();
+        let (bam, gtf) = make_fixture(&case_dir);
+        let whitelist = case_dir.join("barcodes.txt");
+        std::fs::write(&whitelist, "a\nb\nc\n").unwrap();
+        for logic in logics {
+            let reference_out = case_dir.join(format!("reference-{logic}"));
+            let optimized_out = case_dir.join(format!("optimized-{logic}"));
+            let result = std::process::Command::new(&executable)
+                .args([
+                    "run",
+                    &bam,
+                    &gtf,
+                    "-b",
+                    whitelist.to_str().unwrap(),
+                    "-o",
+                    reference_out.to_str().unwrap(),
+                    "-e",
+                    "reference",
+                    "-l",
+                    logic,
+                    "--cb-tag",
+                    "CB",
+                    "--ub-tag",
+                    "MA",
+                    "--sample-tag",
+                    "ST",
+                    "--samtools-threads",
+                    "1",
+                    "--output-format",
+                    "both",
+                ])
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{case}/{logic}: {}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            // The two implementations must sort independently from the same raw BAM.
+            let sorted = case_dir.join("cellsorted_cellsorted.bam");
+            if sorted.exists() {
+                std::fs::remove_file(&sorted).unwrap();
+            }
+            let receipt = sorted.with_extension("bam.sort.json");
+            if receipt.exists() {
+                std::fs::remove_file(receipt).unwrap();
+            }
+            #[derive(clap::Parser)]
+            struct Cli {
+                #[command(flatten)]
+                args: crate::commands::run::RunArgs,
+            }
+            let telemetry = case_dir.join(format!("telemetry-{logic}.jsonl"));
+            let args = Cli::parse_from([
+                "cmd",
                 &bam,
                 &gtf,
                 "-b",
                 whitelist.to_str().unwrap(),
                 "-o",
-                out.to_str().unwrap(),
+                optimized_out.to_str().unwrap(),
                 "-e",
                 "reference",
                 "-l",
@@ -362,68 +552,74 @@ fn differential_against_original_cli() {
                 "ST",
                 "--samtools-threads",
                 "1",
+                "--samtools-memory",
+                "256",
+                "--cell-batch-size",
+                "1",
+                "--count-memory-mb",
+                "256",
                 "--output-format",
                 "both",
+                "--telemetry-jsonl",
+                telemetry.to_str().unwrap(),
             ])
-            .output()
-            .unwrap();
-        assert!(
-            result.status.success(),
-            "{}",
-            String::from_utf8_lossy(&result.stderr)
-        );
-        let mut c = counter(&gtf, &bam, logic);
-        c.sampleid = "reference".into();
-        c.sample_tag = Some("ST".into());
-        let metadata = crate::count_checkpoint::Metadata::from_counter(
-            &c,
-            "x".into(),
-            vec![crate::count_checkpoint::InputIdentity::read(Path::new(&bam)).unwrap()],
-            "fixture".into(),
-        )
-        .unwrap();
-        let mut checkpoint =
-            crate::count_checkpoint::Checkpoint::create(&out.join("counts"), metadata).unwrap();
-        c.count_stream(&bam, false, 1, 0, 1_048_576, |layers, keys, next| {
-            checkpoint.commit_batch(0, next, &layers, &keys)
-        })
-        .unwrap();
-        checkpoint.finish_source(0).unwrap();
-        crate::commands::write_output::export(&checkpoint, &out, "optimized", "both").unwrap();
-        let a = hdf5::File::open(out.join("reference.h5ad")).unwrap();
-        let b = hdf5::File::open(out.join("optimized.h5ad")).unwrap();
-        let read = |f: &hdf5::File, layer: &str| {
-            let ids = f
-                .dataset("obs/_index")
+            .args;
+            crate::commands::run::run(args).unwrap();
+            let checkpoint =
+                crate::count_checkpoint::Checkpoint::open(&optimized_out.join("reference.counts"))
+                    .unwrap();
+            let events: Vec<serde_json::Value> = std::fs::read_to_string(&telemetry)
                 .unwrap()
-                .read_raw::<hdf5::types::VarLenUnicode>()
-                .unwrap();
-            let ptr = f
-                .dataset(&format!("layers/{layer}/indptr"))
-                .unwrap()
-                .read_raw::<i64>()
-                .unwrap();
-            let indices = f
-                .dataset(&format!("layers/{layer}/indices"))
-                .unwrap()
-                .read_raw::<i32>()
-                .unwrap();
-            let data = f
-                .dataset(&format!("layers/{layer}/data"))
-                .unwrap()
-                .read_raw::<u32>()
-                .unwrap();
-            let mut result = std::collections::BTreeMap::new();
-            for (c, id) in ids.iter().enumerate() {
-                let row: Vec<_> = (ptr[c] as usize..ptr[c + 1] as usize)
-                    .map(|i| (indices[i], data[i]))
-                    .collect();
-                result.insert(id.to_string(), row);
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            assert!(events.iter().any(|e| e["event"] == "checkpoint_commit"));
+            assert!(events.iter().any(|e| e["event"] == "run_complete"));
+            if case == "high-depth" {
+                assert!(events.iter().any(|e| {
+                    e["event"] == "count_progress"
+                        && e["records_processed"].as_u64().unwrap_or(0) >= 100_000
+                        && e["records_per_second"].is_number()
+                }));
             }
-            result
-        };
-        for layer in &checkpoint.manifest.metadata.layers {
-            assert_eq!(read(&a, layer), read(&b, layer), "{logic}/{layer}");
+            for layer in &checkpoint.manifest.metadata.layers {
+                let reference_h5ad = read_h5ad_counts(&reference_out.join("reference.h5ad"), layer);
+                let optimized_h5ad = read_h5ad_counts(&optimized_out.join("reference.h5ad"), layer);
+                let reference_loom = read_loom_counts(&reference_out.join("reference.loom"), layer);
+                let optimized_loom = read_loom_counts(&optimized_out.join("reference.loom"), layer);
+                assert_eq!(
+                    reference_h5ad, optimized_h5ad,
+                    "H5AD {case}/{logic}/{layer}"
+                );
+                assert_eq!(
+                    reference_loom, optimized_loom,
+                    "loom {case}/{logic}/{layer}"
+                );
+                assert_eq!(
+                    reference_h5ad, reference_loom,
+                    "reference format counts {case}/{logic}/{layer}"
+                );
+                assert_eq!(
+                    optimized_h5ad, optimized_loom,
+                    "optimized format counts {case}/{logic}/{layer}"
+                );
+                if case == "core" && logic == "Default" {
+                    let total: u64 = reference_h5ad
+                        .values()
+                        .flat_map(BTreeMap::values)
+                        .map(|&v| u64::from(v))
+                        .sum();
+                    assert!(total > 0, "core fixture did not exercise {layer}");
+                }
+                if case == "high-depth" && logic == "Default" {
+                    assert_eq!(
+                        reference_h5ad.len(),
+                        1,
+                        "whitelist admitted an outside barcode"
+                    );
+                    assert_eq!(reference_h5ad.keys().next().unwrap(), "reference_S1:ax");
+                }
+            }
         }
     }
 }

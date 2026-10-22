@@ -1,30 +1,33 @@
 # Quantification implementation and verification
 
-The approved design is in [memory-efficient-quantification-plan.md](memory-efficient-quantification-plan.md). The work is implemented on the existing feature branch. No merge, publication or commit was performed.
+The initial source audit and approved design are in [memory-efficient-quantification-plan.md](memory-efficient-quantification-plan.md). Implementation and verification details for the `feature/sparse-counting` branch are recorded here.
 
 ## Changes
 
-- The CLI now consumes completed count batches instead of retaining all dense batches or cloning them during transfer. The public collecting counter API remains available.
-- Count batches are serialized as compressed sparse integer rows in a durable checkpoint. A small dense batch remains in use so the molecule assignment code and CB/MA behavior stay on the existing paths. The checkpoint keeps full `u32` values, a progress cursor per BAM and ordered cell/gene metadata. Version 1 inline metadata is migrated to version 2 on resume; version 2 stores static gene metadata once, outside the frequently updated progress manifest.
-- H5AD and loom writers read checkpoint batches incrementally. H5AD uses checked `i64` row pointers and per-batch sparse writes; loom writes bounded tiles. Both publish through a sibling partial file and leave previous outputs and failed partials intact.
-- `write-output` regenerates H5AD, loom or both from a completed checkpoint without BAM, GTF or whitelist inputs. `run --resume-from` validates its serialized settings and input path/size/mtime identities, checks committed shards and seeks to the saved BGZF cursor.
-- Sorted BAMs use a completion receipt before reuse. Rust sort spill runs live in persistent directories and multi-pass merging bounds open runs. Temporary inputs are retained on success and failure.
-- Count budgets bound estimates for reads, mapping evidence and batch scratch separately. They do not cap whole-process RSS. An oversized single barcode/UMI group fails with a diagnostic and leaves its checkpoint intact.
+- The CLI consumes count batches instead of retaining or cloning all dense batches. The collecting library API remains available.
+- Batch flushes release unusually large empty `Read` buffers. GTF parsing releases the emptied raw-line vector after moving strings to sorted storage.
+- Production `run` releases the original annotation model map after indexes and validation state are ready. The complete models used by counting remain available in the flat/indexed representations.
+- Count batches are compressed sparse integer rows in durable checkpoints. Checkpoints retain `u32` counts, ordered cell/gene metadata, and a per-BAM cursor. Version 1 metadata migrates to version 2, where static gene metadata is written once.
+- H5AD streams sparse batches; loom writes bounded tiles. Both publish through sibling partial files and preserve prior outputs on failure. `write-output` can regenerate formats from a completed checkpoint.
+- Counting resume verifies settings, input path/size/mtime, and committed shards before seeking to the saved BGZF cursor. It rebuilds annotation and reruns intron validation.
+- BAM CIGAR parsing no longer allocates a temporary tuple vector per record. Sort chunk estimates include sequence, CIGAR, auxiliary payload, and cached tag key sizes.
+- Sorting uses bounded merge fan-in and a staged work directory. A completed staged BAM is published after provenance checks; an incomplete sort is removed and repeated. Completed sort receipts bind the output to source identity and tag.
+- Optional telemetry records phases, process RSS/HWM, record/barcode progress, batch estimates, checkpoint commits, throughput, completion, and errors. Events flush when written. A telemetry write failure disables telemetry and does not abort quantification.
+- `--version` reports the package version. No Cargo dependencies or lockfile entries were added. The executable remains dynamically linked to the HDF5 library available at build time.
 
-## Verification performed
+## Verification
 
-- Baseline on original source: 66 passed, 1 ignored. A reference executable was built from the original revision.
-- Reference differential test against that executable passed for the seven available logic variants, comparing integer layer values by cell identity. The same fixture covers BD `CB`/`MA`, UMI evidence, multiple batches, interrupted resume, and output-only restart. The external-reference test remains ignored unless `VELOCYTO_REFERENCE_BIN` is supplied.
-- Current `cargo test --locked --offline`: 83 passed, 2 ignored. The ignored tests need the original external BAM fixtures and reference executable.
-- Current `cargo test --locked --offline --no-default-features`: 65 passed, 0 ignored.
-- The latest 187,000-cell by 30,000-gene synthetic output was opened independently with AnnData. Shape was `(187000, 30000)`; each named integer layer contained exactly 187,000 nonzeros and `X` contained 561,000 nonzeros, as designed by the synthetic fixture.
-- A checkpoint migration regression verifies that v1 inline metadata resumes and atomically becomes v2. Checkpoint corruption, exact sparse round-trip, export failure retention, and multi-BAM cursor resume tests pass.
-- The storage benchmark results and commands are recorded in [quantification-benchmarks.md](quantification-benchmarks.md).
+- Reference executable was built from source commit `17df61dae812f132c5b955b55b6e6e3efc12a1b7`.
+- Differential tests passed for 8 logic variants × 3 generated BAM fixtures (24 runs). Counts match exactly by CellID, unique gene accession, and integer layer for both H5AD and loom. Fixtures cover transcript overlaps, repeated UMIs, spliced/unspliced/ambiguous evidence, high-depth barcode and UMI groups, malformed/missing tags, whitelist filtering, and independent sort paths.
+- Default tests: 90 passed, 2 ignored. No-default-feature tests: 66 passed. The ignored tests require an external reference executable or large real BAM fixture.
+- `cargo fmt --all -- --check`, all-target checks with and without BAM support, and release build passed. Clippy completes with legacy warnings; strict warning-free linting is not established.
+- Synthetic H5AD storage benchmark: 3,000 × 10,000 dense writer used 609,844 KiB peak RSS; sparse checkpoint + streamed H5AD used 29,776 KiB. This tests output storage, not BAM counting or production memory.
+- Local executables and build sidecars are excluded under `artifacts/`; no installable package is published.
 
 ## Remaining limits
 
-No real BD BAM, two-billion-record run, Slurm allocation or production filesystem was available for validation. The synthetic benchmark measures checkpoint and H5AD storage, not BAM decoding, sorting, molecule assignment, concurrent job memory or cluster storage behavior. Per-process RSS is not Slurm job RSS.
+No full production BAM, Dragon3 allocation, or production filesystem was available. Fixture comparisons do not establish equivalence on the complete production dataset. The synthetic benchmark does not measure BAM decoding, sorting, molecule assignment, total process RSS, or Slurm cgroup memory.
 
-Counting resume rebuilds the annotation index and reruns intron validation against the original BAMs. Existing partial sort runs are retained but are not resumed; the sort is repeated unless a validated completed sort receipt exists. Input identity uses canonical path, file size and modification time rather than a full content hash. A single pathological barcode or UMI is rejected if its estimate exceeds the configured component budget; disk-backed evidence processing for such groups is not implemented. Use persistent storage that survives the Slurm job and supports locking, `fsync` and atomic rename.
+`--count-memory-mb` limits estimated read, evidence, and scratch components, not total RSS. A single oversized barcode/UMI group can fail explicitly; evidence spilling to disk is not implemented. Resume reruns annotation parsing and intron validation. Input identity uses canonical path, file size, and modification time rather than a full content hash. Atomic rename, fsync, and locking depend on filesystem support. H5AD `X` is float32; integer layers retain exact values. HDF5/system-library compatibility on Dragon3 remains unverified.
 
-The critical-thinking workflow applied here was a procedural aid for separating source observations, synthetic checks and unverified production claims; it is not evidence for performance or biological validity: Kassis, T., Agarwal, V., He, Y., Patel, D., & Brueckner, A. M. (2026). *Scientific Agent Skills: A Library of Procedural Knowledge for Research Agents*. arXiv:2609.00065. https://doi.org/10.48550/arXiv.2609.00065
+The critical-thinking workflow was used to separate observed source behavior, fixture evidence, synthetic measurement, and unverified production claims. It is not empirical evidence of performance or biological validity: Kassis, T., Agarwal, V., He, Y., Patel, D., & Brueckner, A. M. (2026). *Scientific Agent Skills: A Library of Procedural Knowledge for Research Agents*. [arXiv:2609.00065](https://arxiv.org/abs/2609.00065).

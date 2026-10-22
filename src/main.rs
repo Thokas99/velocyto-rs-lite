@@ -3,7 +3,8 @@ use clap::{Parser, Subcommand};
 #[derive(Parser)]
 #[command(
     name = "velocyto-rs",
-    about = "RNA velocity analysis for single-cell RNA-seq data"
+    about = "RNA velocity analysis for single-cell RNA-seq data",
+    version
 )]
 struct Cli {
     #[command(subcommand)]

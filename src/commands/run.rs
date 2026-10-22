@@ -5,6 +5,7 @@ use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::time::Instant;
 
 use anyhow::{bail, Context};
 use clap::Args;
@@ -13,6 +14,7 @@ use rand::Rng;
 use crate::constants::BAM_COMPRESSION;
 use crate::counter::ExInCounter;
 use crate::logic::logic_from_name;
+use crate::telemetry::Telemetry;
 
 #[derive(Args)]
 pub struct CountingOptions {
@@ -28,6 +30,9 @@ pub struct CountingOptions {
     /// MiB budget per count read/evidence/scratch component (not total job RSS)
     #[arg(long, default_value_t = 512)]
     pub count_memory_mb: usize,
+    /// Append structured phase and progress events to this JSONL file
+    #[arg(long, value_name = "PATH")]
+    pub telemetry_jsonl: Option<std::path::PathBuf>,
 }
 impl Default for CountingOptions {
     fn default() -> Self {
@@ -36,6 +41,7 @@ impl Default for CountingOptions {
             resume_from: None,
             cell_batch_size: 100,
             count_memory_mb: 512,
+            telemetry_jsonl: None,
         }
     }
 }
@@ -122,7 +128,13 @@ pub struct RunArgs {
 ///
 /// Thin wrapper that forwards all [`RunArgs`] fields to [`run_inner`].
 pub fn run(args: RunArgs) -> anyhow::Result<()> {
-    run_inner_with_options(
+    let mut telemetry = args
+        .counting
+        .telemetry_jsonl
+        .as_deref()
+        .map(Telemetry::open)
+        .transpose()?;
+    let result = run_inner_with_options(
         &args.bamfile,
         &args.gtffile,
         args.bcfile.as_deref(),
@@ -144,7 +156,14 @@ pub fn run(args: RunArgs) -> anyhow::Result<()> {
         args.sample_tag.as_deref(),
         &args.output_format,
         &args.counting,
-    )
+        &mut telemetry,
+    );
+    if let Err(error) = &result {
+        if let Some(telemetry) = telemetry.as_mut() {
+            let _ = telemetry.error(error);
+        }
+    }
+    result
 }
 
 /// Generate a random alphanumeric identifier of the given length.
@@ -226,6 +245,7 @@ pub fn run_inner(
     sample_tag: Option<&str>,
     output_format: &str,
 ) -> anyhow::Result<()> {
+    let mut telemetry = None;
     run_inner_with_options(
         bamfile,
         gtffile,
@@ -248,10 +268,12 @@ pub fn run_inner(
         sample_tag,
         output_format,
         &CountingOptions::default(),
+        &mut telemetry,
     )
 }
 
 #[cfg(feature = "bam")]
+#[allow(clippy::too_many_arguments)]
 fn run_inner_with_options(
     bamfile: &[String],
     gtffile: &str,
@@ -274,7 +296,9 @@ fn run_inner_with_options(
     sample_tag: Option<&str>,
     output_format: &str,
     counting: &CountingOptions,
+    telemetry: &mut Option<Telemetry>,
 ) -> anyhow::Result<()> {
+    let mut phase_started = Instant::now();
     // ── Resolve inputs ────────────────────────────────────────────────────────
     validate_loom_dtype(loom_numeric_dtype)?;
     validate_output_format(output_format)?;
@@ -433,6 +457,7 @@ fn run_inner_with_options(
         log::info!("Sample demultiplexing enabled on BAM tag '{st}'");
         exincounter.sample_tag = Some(st.to_string());
     }
+    telemetry_phase(telemetry, "input_setup", &mut phase_started)?;
 
     // ── Cell-sorted BAM paths ─────────────────────────────────────────────────
     let bamfile_cellsorted: Vec<String> = if multi && onefilepercell {
@@ -465,6 +490,7 @@ fn run_inner_with_options(
             )?;
         }
     }
+    telemetry_phase(telemetry, "bam_sort", &mut phase_started)?;
 
     // ── Load annotations after sorting ────────────────────────────────
     log::info!("Loading annotation from {gtffile}");
@@ -474,12 +500,18 @@ fn run_inner_with_options(
         log::info!("Loading repeat mask from {mask_path}");
         exincounter.read_repeats(mask_path, 0)?;
     }
+    telemetry_phase(telemetry, "annotation_load", &mut phase_started)?;
 
     // ── Mark up introns ───────────────────────────────────────────────────────
     log::info!("Scanning BAM(s) to validate intron intervals");
     for bmf in bamfile.iter() {
         exincounter.mark_up_introns(bmf, multimap)?;
     }
+    if exincounter.feature_indexes.is_empty() {
+        exincounter.build_feature_indexes();
+    }
+    drop(std::mem::take(&mut exincounter.annotations_by_chrm_strand));
+    telemetry_phase(telemetry, "intron_validation", &mut phase_started)?;
 
     // ── Durable counts and bounded output ────────────────────────────────────
     use crate::count_checkpoint::{Checkpoint, InputIdentity, Metadata};
@@ -523,29 +555,67 @@ fn run_inner_with_options(
         Checkpoint::create(&root, metadata)?
     };
     log::info!("Persistent counting checkpoint: {}", root.display());
+    let mut checkpoint_commits = checkpoint.manifest.batches.len() as u64;
     for (source, bam) in bamfile_cellsorted.iter().enumerate() {
         if checkpoint.manifest.sources[source].complete {
             continue;
         }
         let offset = checkpoint.manifest.sources[source].offset;
-        exincounter.count_stream(
-            bam,
-            multimap,
-            counting.cell_batch_size,
-            offset,
-            count_bytes,
-            |layers, keys, next| {
-                checkpoint.commit_batch(source, next, &layers, &keys)?;
-                log::info!(
-                    "Committed count batch {} ({} cells)",
-                    checkpoint.manifest.batches.len(),
-                    keys.len()
-                );
-                Ok(())
-            },
-        )?;
+        if telemetry.is_some() {
+            let mut commits = checkpoint_commits;
+            {
+                let mut progress = |stats| {
+                    telemetry_best_effort(telemetry, |telemetry| {
+                        telemetry.count_progress(source, commits, stats)
+                    });
+                    if stats.batch_committed {
+                        commits += 1;
+                    }
+                    Ok(())
+                };
+                exincounter.count_stream_with_progress(
+                    bam,
+                    multimap,
+                    counting.cell_batch_size,
+                    offset,
+                    count_bytes,
+                    Some(&mut progress),
+                    |layers, keys, next| {
+                        checkpoint.commit_batch(source, next, &layers, &keys)?;
+                        log::info!(
+                            "Committed count batch {} ({} cells)",
+                            checkpoint.manifest.batches.len(),
+                            keys.len()
+                        );
+                        Ok(())
+                    },
+                )?;
+            }
+            checkpoint_commits = commits;
+        } else {
+            exincounter.count_stream(
+                bam,
+                multimap,
+                counting.cell_batch_size,
+                offset,
+                count_bytes,
+                |layers, keys, next| {
+                    checkpoint.commit_batch(source, next, &layers, &keys)?;
+                    log::info!(
+                        "Committed count batch {} ({} cells)",
+                        checkpoint.manifest.batches.len(),
+                        keys.len()
+                    );
+                    Ok(())
+                },
+            )?;
+        }
         checkpoint.finish_source(source)?;
+        telemetry_best_effort(telemetry, |telemetry| {
+            telemetry.source_complete(source, checkpoint.manifest.batches.len())
+        });
     }
+    telemetry_phase(telemetry, "counting", &mut phase_started)?;
     // Annotation and barcode buffers are not needed by checkpoint-backed export.
     drop(exincounter);
     crate::commands::write_output::export(
@@ -554,10 +624,12 @@ fn run_inner_with_options(
         &sampleid,
         output_format,
     )?;
+    telemetry_phase(telemetry, "output", &mut phase_started)?;
 
     let _ = additional_ca; // float col attrs not yet supported by hdf5-pure-rust string-only API
 
     log::info!("Terminated successfully!");
+    telemetry_best_effort(telemetry, Telemetry::complete);
     Ok(())
 }
 
@@ -613,6 +685,7 @@ fn run_inner_with_options(
     sample_tag: Option<&str>,
     output_format: &str,
     counting: &CountingOptions,
+    _telemetry: &mut Option<Telemetry>,
 ) -> anyhow::Result<()> {
     anyhow::bail!("BAM support required. Recompile with: cargo build --features bam")
 }
@@ -670,6 +743,33 @@ fn read_mem_available_mb() -> u64 {
     available
 }
 
+#[cfg(feature = "bam")]
+fn telemetry_phase(
+    telemetry: &mut Option<Telemetry>,
+    phase: &str,
+    phase_started: &mut Instant,
+) -> anyhow::Result<()> {
+    telemetry_best_effort(telemetry, |telemetry| {
+        telemetry.phase(phase, phase_started.elapsed())
+    });
+    *phase_started = Instant::now();
+    Ok(())
+}
+
+#[cfg(feature = "bam")]
+fn telemetry_best_effort(
+    telemetry: &mut Option<Telemetry>,
+    write_event: impl FnOnce(&mut Telemetry) -> anyhow::Result<()>,
+) {
+    let error = telemetry
+        .as_mut()
+        .and_then(|telemetry| write_event(telemetry).err());
+    if let Some(error) = error {
+        log::warn!("Telemetry disabled after write error: {error:#}");
+        *telemetry = None;
+    }
+}
+
 /// Count logical CPU cores by counting `processor` entries in `/proc/cpuinfo`.
 ///
 /// Falls back to 1 when `/proc/cpuinfo` is unavailable (non-Linux systems).
@@ -719,6 +819,7 @@ fn validate_output_format(format: &str) -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use std::io::Write;
+    use std::time::Duration;
     use tempfile::NamedTempFile;
 
     // ── id_generator ──────────────────────────────────────────────────────────
@@ -759,6 +860,14 @@ mod tests {
     #[cfg(feature = "bam")]
     fn num_cpus_returns_at_least_one() {
         assert!(num_cpus() >= 1);
+    }
+
+    #[test]
+    #[cfg(all(feature = "bam", target_os = "linux"))]
+    fn telemetry_write_failure_disables_telemetry_without_aborting_work() {
+        let mut telemetry = Some(Telemetry::open(Path::new("/dev/full")).unwrap());
+        telemetry_best_effort(&mut telemetry, |t| t.phase("test", Duration::ZERO));
+        assert!(telemetry.is_none());
     }
 
     // ── barcode parsing (gem_grp logic extracted for testing) ─────────────────
