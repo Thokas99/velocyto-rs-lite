@@ -21,7 +21,6 @@ include = [
     "/Cargo.toml",
     "/Cargo.lock",
     "/README.md",
-    "/README.full.md",
     "/LICENSE",
 ]
 
