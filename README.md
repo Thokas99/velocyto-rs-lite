@@ -1,16 +1,16 @@
 # velocyto-rs-lite
 
-`velocyto-rs` is a Rust command-line tool that assigns RNA-sequencing reads to genes and counts molecules as **spliced**, **unspliced**, or **ambiguous** for each cell. It reads BAM alignments, a genome annotation in GTF format, and optionally a barcode whitelist, then writes an AnnData H5AD file, a Loom file, or both.
+This is my personal fork of [zqfang/velocyto-rs](https://github.com/zqfang/velocyto-rs), a Rust translation of [velocyto.py v0.17.16](https://github.com/velocyto-team/velocyto.py). I’m focusing this fork on bounded counting, resumable work, and output that can be regenerated without reading the BAM files again.
 
-This repository is a Rust implementation of the velocyto single-cell quantification workflow. It prepares count matrices for downstream RNA-velocity analysis; it does not fit a velocity model or infer cell trajectories. The existing molecule-assignment and UMI-counting rules are preserved.
+`velocyto-rs` assigns RNA-sequencing reads to genes and counts molecules as **spliced**, **unspliced**, or **ambiguous** for each cell. It reads BAM alignments, a genome annotation in GTF format, and optionally a barcode whitelist, then writes an AnnData H5AD file, a Loom file, or both. It prepares matrices for downstream RNA-velocity analysis; it does not fit a velocity model or infer cell trajectories. The existing molecule-assignment and UMI-counting rules are preserved.
 
-The memory and recovery work was developed for BD Rhapsody whole-transcriptome datasets of roughly 187,000 cells and 2 billion alignments. Those numbers describe the target workload; a complete production BAM run has not yet been measured with this branch.
+The memory and recovery work targets BD Rhapsody whole-transcriptome datasets of roughly 187,000 cells and 2 billion alignments. Those numbers describe the target workload; a complete production BAM run has not yet been measured with this branch.
 
-## Why this work was needed
+## Why I focused on memory and recovery
 
 The earlier command-line path retained dense count batches and made additional copies while combining them. The output writers then assembled whole-dataset matrices before writing sparse files, so sparse output alone did not keep memory bounded. The original audit also found avoidable annotation and read-buffer retention. At an illustrative shape of 187,000 cells × 30,000 genes × 3 `u32` layers, dense count values alone occupy about 62.7 GiB; actual memory depends on the gene count, temporary allocations, and data lifetimes. The approximately 150 GiB Slurm peak is the user's reported observation, not a measurement independently reproduced here.
 
-## What changed
+## What this fork adds
 
 - **Bounded counting:** the command-line workflow consumes barcode batches and releases each batch after it is committed, instead of retaining or cloning all dense batches in memory. A single unusually large barcode/UMI group can still exceed the configured estimate and will fail explicitly.
 - **Sparse, persistent checkpoints:** completed batches are stored as compressed sparse integer counts with cell/gene metadata and a per-BAM resume cursor. Checkpoint files are retained so counting can resume or output can be regenerated after interruption.
@@ -141,6 +141,6 @@ Raw driver reports: [dense 3,000 × 10,000](docs/benchmark-results/dense-3000x10
 
 The next performance check should run a representative BAM under the intended Slurm allocation and record `sacct` or cgroup peak memory, runtime by phase, and filesystem I/O. Do not extrapolate the 94-second synthetic output-only benchmark to a 2-billion-record BAM.
 
-## Acknowledgment
+## Acknowledgments
 
-The documentation used the evidence-first writing and visualization procedures from Kassis T, Agarwal V, He Y, Patel D, Brueckner AM. *Scientific Agent Skills: A Library of Procedural Knowledge for Research Agents*. arXiv:2609.00065 (v2, 2026). [https://doi.org/10.48550/arXiv.2609.00065](https://doi.org/10.48550/arXiv.2609.00065).
+The evidence-focused documentation approach was informed by Kassis T, Agarwal V, He Y, Patel D, Brueckner AM. *Scientific Agent Skills: A Library of Procedural Knowledge for Research Agents*. 2026. [doi:10.48550/arXiv.2609.00065](https://doi.org/10.48550/arXiv.2609.00065).
